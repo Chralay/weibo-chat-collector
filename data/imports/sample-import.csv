@@ -1,0 +1,4 @@
+account,group,source_message_id,sender_name,source_user_id,sent_at,message_type,content_text,attachments_json
+account_b,group_b,csv-msg-001,csv_user,csv-user-001,2026-06-10 22:00:00,text,CSV import message,[]
+account_b,group_b,csv-msg-002,csv_link_user,csv-user-002,2026-06-10 22:05:00,link,CSV link message,"[{""attachment_type"":""link"",""source_url"":""https://example.com"",""title"":""Example"",""download_status"":""referenced""}]"
+

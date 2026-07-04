@@ -1,0 +1,39 @@
+{
+  "account": "account_a",
+  "group": "group_a",
+  "messages": [
+    {
+      "source_message_id": "sg-001",
+      "source_user_id": "user-001",
+      "sender_name": "示例用户甲",
+      "sent_at": "2026-06-08 09:12:00",
+      "message_type": "text",
+      "content_text": "这是单群聊采集样例消息。"
+    },
+    {
+      "source_message_id": "sg-002",
+      "source_user_id": "user-002",
+      "sender_name": "示例用户乙",
+      "sent_at": "2026-06-08 09:18:00",
+      "message_type": "image",
+      "content_text": "图片样例",
+      "attachments": [
+        {
+          "attachment_type": "image",
+          "source_url": "https://example.invalid/redacted-image.jpg",
+          "file_name": "redacted-image.jpg",
+          "mime_type": "image/jpeg",
+          "download_status": "pending"
+        }
+      ]
+    },
+    {
+      "source_message_id": "sg-003",
+      "source_user_id": "user-003",
+      "sender_name": "示例用户丙",
+      "sent_at": "2026-06-08 09:20:00",
+      "message_type": "red_packet",
+      "content_text": "[红包]"
+    }
+  ]
+}

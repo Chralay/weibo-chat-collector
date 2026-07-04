@@ -1,0 +1,40 @@
+{
+  "account": "account_a",
+  "group": "group_a",
+  "messages": [
+    {
+      "source_message_id": "sample-msg-001",
+      "sender_name": "sample_user",
+      "source_user_id": "sample-user-001",
+      "sent_at": "2026-06-10 21:00:00",
+      "message_type": "text",
+      "content_text": "Sample message for import testing.",
+      "attachments": []
+    },
+    {
+      "source_message_id": "sample-msg-002",
+      "sender_name": "image_user",
+      "source_user_id": "sample-user-002",
+      "sent_at": "2026-06-10 21:05:00",
+      "message_type": "image",
+      "content_text": "Sample image message.",
+      "attachments": [
+        {
+          "attachment_type": "image",
+          "source_url": "https://example.com/sample.jpg",
+          "file_name": "sample.jpg",
+          "download_status": "pending"
+        }
+      ]
+    },
+    {
+      "source_message_id": "sample-msg-003",
+      "sender_name": "red_packet_user",
+      "source_user_id": "sample-user-003",
+      "sent_at": "2026-06-10 21:10:00",
+      "message_type": "red_packet",
+      "content_text": "[红包]",
+      "attachments": []
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+INFO:     127.0.0.1:63808 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:63810 - "GET /api/browser-capture/snippet?account_id=1&group_id=1&range_start=2026-06-15%2017:00:00&range_end=2026-06-21%2023:59:59 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51880 - "GET /api/browser-capture/snippet?account_id=1&group_id=1&range_start=2026-06-15%2017:00:00&range_end=2026-06-21%2023:59:59 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51882 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51884 - "GET /api/browser-capture/snippet?account_id=1&group_id=1&range_start=2026-06-15%2017:00:00&range_end=2026-06-21%2023:59:59 HTTP/1.1" 200 OK
