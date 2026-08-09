@@ -207,6 +207,7 @@ CREATE TABLE IF NOT EXISTS search_indexes (
 );
 
 CREATE INDEX IF NOT EXISTS idx_chat_groups_account_id ON chat_groups(account_id);
+CREATE INDEX IF NOT EXISTS idx_chat_groups_source_id ON chat_groups(account_id, source_group_id);
 CREATE INDEX IF NOT EXISTS idx_group_members_group_id ON group_members(group_id);
 CREATE INDEX IF NOT EXISTS idx_messages_account_group_sent_at ON messages(account_id, group_id, sent_at);
 CREATE INDEX IF NOT EXISTS idx_messages_user_id ON messages(user_id);

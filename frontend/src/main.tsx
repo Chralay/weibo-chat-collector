@@ -22,13 +22,25 @@ const PAGE_SIZE = 100;
 type Account = {
   id: number;
   display_name: string;
+  auth_type: string;
+  login_profile_name: string | null;
   is_active: number;
+  cookie_profile?: CookieProfileStatus;
+};
+
+type CookieProfileStatus = {
+  account_id: number;
+  exists: boolean;
+  authenticated: boolean;
+  cookie_count: number;
+  updated_at: string | null;
 };
 
 type Group = {
   id: number;
   account_id: number;
   name: string;
+  source_group_id: string | null;
   account_name: string;
   is_active: number;
 };
@@ -139,6 +151,12 @@ type CollectionJobForm = {
   rangeStart: string;
   rangeEnd: string;
   sourceFile: string;
+};
+
+type ApiTargetForm = {
+  accountName: string;
+  groupName: string;
+  sourceGroupId: string;
 };
 
 type ImportFile = {
@@ -306,6 +324,12 @@ const emptyCollectionJobForm: CollectionJobForm = {
   sourceFile: "",
 };
 
+const emptyApiTargetForm: ApiTargetForm = {
+  accountName: "",
+  groupName: "",
+  sourceGroupId: "",
+};
+
 const emptyVerificationReportForm: VerificationReportForm = {
   accountId: "",
   groupId: "",
@@ -433,6 +457,20 @@ function resolveCollectionTarget(data: FilterOptions, current: Pick<CollectionJo
   return { accountId, groupId };
 }
 
+function resolveApiTargetForm(
+  data: FilterOptions,
+  accountId: string,
+  groupId: string,
+): ApiTargetForm {
+  const account = data.accounts.find((item) => String(item.id) === accountId);
+  const group = data.groups.find((item) => String(item.id) === groupId);
+  return {
+    accountName: account?.display_name ?? "",
+    groupName: group?.name ?? "",
+    sourceGroupId: group?.source_group_id ?? "",
+  };
+}
+
 function getAttachmentIcon(type: string) {
   if (type === "image") return Image;
   if (type === "link") return Link;
@@ -445,6 +483,7 @@ function formatMessageType(type: string): string {
     image: "图片",
     file: "文件",
     link: "链接",
+    video: "视频",
     system: "系统",
   };
   return labels[type] ?? type;
@@ -544,6 +583,8 @@ function App() {
   const [collectionJobForm, setCollectionJobForm] = useState<CollectionJobForm>(
     emptyCollectionJobForm,
   );
+  const [apiTargetForm, setApiTargetForm] = useState<ApiTargetForm>(emptyApiTargetForm);
+  const [cookieFileName, setCookieFileName] = useState("");
   const [collectionJobStatusFilter, setCollectionJobStatusFilter] = useState("");
   const [importFiles, setImportFiles] = useState<ImportFile[]>([]);
   const [browserCaptures, setBrowserCaptures] = useState<BrowserCapture[]>([]);
@@ -578,6 +619,16 @@ function App() {
     );
   }, [collectionJobForm.accountId, options.groups]);
 
+  const selectedCollectionAccount = useMemo(
+    () => options.accounts.find((account) => String(account.id) === collectionJobForm.accountId),
+    [collectionJobForm.accountId, options.accounts],
+  );
+
+  const selectedCollectionGroup = useMemo(
+    () => options.groups.find((group) => String(group.id) === collectionJobForm.groupId),
+    [collectionJobForm.groupId, options.groups],
+  );
+
   const visibleVerificationGroups = useMemo(() => {
     if (!verificationForm.accountId) return options.groups;
     return options.groups.filter(
@@ -588,13 +639,28 @@ function App() {
   const groupedMessages = useMemo(() => groupMessagesByDate(messages), [messages]);
 
   async function loadOptions() {
-    const data = await fetchJson<FilterOptions>("/api/filter-options", "筛选项加载");
-    setOptions(data);
-    setCollectionJobForm((current) => {
-      const { accountId, groupId } = resolveCollectionTarget(data, current);
-      return { ...current, accountId, groupId };
-    });
-    return data;
+    const [data, apiStatus] = await Promise.all([
+      fetchJson<FilterOptions>("/api/filter-options", "筛选项加载"),
+      fetchJson<{ accounts: Array<Account & { cookie_profile: CookieProfileStatus }> }>(
+        "/api/weibo-api/status",
+        "API 状态加载",
+      ),
+    ]);
+    const statusByAccount = new Map(
+      apiStatus.accounts.map((account) => [account.id, account.cookie_profile]),
+    );
+    const mergedData: FilterOptions = {
+      ...data,
+      accounts: data.accounts.map((account) => ({
+        ...account,
+        cookie_profile: statusByAccount.get(account.id),
+      })),
+    };
+    setOptions(mergedData);
+    const { accountId, groupId } = resolveCollectionTarget(mergedData, collectionJobForm);
+    setCollectionJobForm((current) => ({ ...current, accountId, groupId }));
+    setApiTargetForm(resolveApiTargetForm(mergedData, accountId, groupId));
+    return mergedData;
   }
 
   async function loadMessages(
@@ -940,6 +1006,140 @@ function App() {
     }
   }
 
+  async function saveApiTarget() {
+    setJobLoading(true);
+    setJobMessage(null);
+    setError(null);
+    try {
+      if (
+        !apiTargetForm.accountName.trim() ||
+        !apiTargetForm.groupName.trim() ||
+        !apiTargetForm.sourceGroupId.trim()
+      ) {
+        throw new Error("请填写账号名称、群聊名称和群 ID");
+      }
+      const response = await fetch(`${API_BASE_URL}/api/weibo-api/targets`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          account_id: collectionJobForm.accountId
+            ? Number(collectionJobForm.accountId)
+            : null,
+          account_name: apiTargetForm.accountName.trim(),
+          group_id: collectionJobForm.groupId ? Number(collectionJobForm.groupId) : null,
+          group_name: apiTargetForm.groupName.trim(),
+          source_group_id: apiTargetForm.sourceGroupId.trim(),
+        }),
+      });
+      if (!response.ok) {
+        const errorBody = (await response.json().catch(() => null)) as { detail?: string } | null;
+        throw new Error(errorBody?.detail || "API 采集目标保存失败");
+      }
+      const result = (await response.json()) as { account: Account; group: Group };
+      await loadOptions();
+      setCollectionJobForm((current) => ({
+        ...current,
+        accountId: String(result.account.id),
+        groupId: String(result.group.id),
+      }));
+      setApiTargetForm({
+        accountName: result.account.display_name,
+        groupName: result.group.name,
+        sourceGroupId: result.group.source_group_id ?? "",
+      });
+      setJobMessage("API 账号和群聊绑定已保存");
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "请求失败");
+    } finally {
+      setJobLoading(false);
+    }
+  }
+
+  async function importAccountCookies(file: File | undefined) {
+    if (!file) return;
+    setJobLoading(true);
+    setJobMessage(null);
+    setError(null);
+    try {
+      if (!collectionJobForm.accountId) {
+        throw new Error("请先保存或选择一个账号");
+      }
+      const parsed = JSON.parse(await file.text()) as unknown;
+      const cookies = Array.isArray(parsed)
+        ? parsed
+        : typeof parsed === "object" && parsed !== null && "cookies" in parsed
+          ? (parsed as { cookies: unknown }).cookies
+          : null;
+      if (!Array.isArray(cookies)) {
+        throw new Error("Cookie 文件必须是 auto 项目生成的 JSON 数组");
+      }
+      const response = await fetch(
+        `${API_BASE_URL}/api/weibo-api/accounts/${collectionJobForm.accountId}/cookies`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cookies }),
+        },
+      );
+      if (!response.ok) {
+        const errorBody = (await response.json().catch(() => null)) as { detail?: string } | null;
+        throw new Error(errorBody?.detail || "账号 Cookie 导入失败");
+      }
+      const status = (await response.json()) as { cookie_count?: number };
+      setCookieFileName(file.name);
+      await loadOptions();
+      setJobMessage(`账号登录态已安全导入（${status.cookie_count ?? cookies.length} 个 Cookie）`);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Cookie 文件读取失败");
+    } finally {
+      setJobLoading(false);
+    }
+  }
+
+  async function runWeiboApiCollection() {
+    setJobLoading(true);
+    setJobMessage(null);
+    setError(null);
+    try {
+      if (
+        !collectionJobForm.accountId ||
+        !collectionJobForm.groupId ||
+        !collectionJobForm.rangeStart ||
+        !collectionJobForm.rangeEnd
+      ) {
+        throw new Error("请先选择账号、群聊、开始时间和结束时间");
+      }
+      const response = await fetch(`${API_BASE_URL}/api/collection-jobs/weibo-api`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          account_id: Number(collectionJobForm.accountId),
+          group_id: Number(collectionJobForm.groupId),
+          range_start: formatDateTimeLocal(collectionJobForm.rangeStart),
+          range_end: formatDateTimeLocal(collectionJobForm.rangeEnd),
+        }),
+      });
+      if (!response.ok) {
+        const errorBody = (await response.json().catch(() => null)) as { detail?: string } | null;
+        throw new Error(errorBody?.detail || "微博 API 采集失败");
+      }
+      const result = (await response.json()) as {
+        summary: SingleGroupCollectionSummary & { page_count?: number };
+      };
+      setJobMessage(
+        `API 采集完成：新增 ${result.summary.inserted_count}，跳过 ${result.summary.skipped_count}，红包 ${result.summary.red_packet_count}，附件 ${result.summary.attachment_count}`,
+      );
+      await loadCollectionJobs();
+      await loadOptions();
+      await loadMessages(appliedFilters);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "请求失败");
+      await loadCollectionJobs().catch(() => undefined);
+    } finally {
+      setJobLoading(false);
+    }
+  }
+
   async function createCollectionJob() {
     setJobLoading(true);
     setJobMessage(null);
@@ -1195,11 +1395,9 @@ function App() {
 
   async function loadJobView() {
     setError(null);
-    const optionsData = await loadOptions();
-    const { accountId, groupId } = resolveCollectionTarget(optionsData, collectionJobForm);
+    await loadOptions();
     await loadCollectionJobs();
     await loadImportFiles();
-    await loadBrowserCaptures(accountId, groupId);
     setError(null);
   }
 
@@ -1286,7 +1484,7 @@ function App() {
           <h1>微博群聊归档库</h1>
           <p>
             {viewMode === "jobs"
-              ? "创建时间段采集任务，等待后续微博采集适配器接入"
+              ? "多账号隔离登录态，通过微博消息 API 按时间段采集并直接落库"
               : viewMode === "weibo"
                 ? "记录微博实机验证结果和脱敏接口观察，为真实采集器做准备"
               : viewMode === "deleted"
@@ -1361,7 +1559,7 @@ function App() {
           <CalendarDays size={18} aria-hidden="true" />
           <span>
             {viewMode === "jobs"
-              ? "任务只记录时间段，暂不执行微博采集"
+              ? "严格按所选开始与结束时间过滤"
               : viewMode === "weibo"
                 ? "先记录脱敏结构，不保存 Cookie 或 Token"
               : viewMode === "deleted"
@@ -1373,7 +1571,7 @@ function App() {
           <Search size={18} aria-hidden="true" />
           <span>
             {viewMode === "jobs"
-              ? "后续接入真实采集器"
+              ? "API 分页采集，文件导入保留为备用"
               : viewMode === "weibo"
                 ? "观察样例必须先脱敏"
                 : "正文与附件字段可搜索"}
@@ -1397,15 +1595,21 @@ function App() {
               <span>账号</span>
               <select
                 value={collectionJobForm.accountId}
-                onChange={(event) =>
+                onChange={(event) => {
+                  const accountId = event.target.value;
+                  const groupId = String(
+                    options.groups.find((group) => String(group.account_id) === accountId)?.id ?? "",
+                  );
                   setCollectionJobForm((current) => ({
                     ...current,
-                    accountId: event.target.value,
-                    groupId: "",
-                  }))
-                }
+                    accountId,
+                    groupId,
+                  }));
+                  setApiTargetForm(resolveApiTargetForm(options, accountId, groupId));
+                  setCookieFileName("");
+                }}
               >
-                <option value="">选择账号</option>
+                <option value="">＋ 新增账号</option>
                 {options.accounts.map((account) => (
                   <option key={account.id} value={account.id}>
                     {account.display_name}
@@ -1418,14 +1622,18 @@ function App() {
               <span>群聊</span>
               <select
                 value={collectionJobForm.groupId}
-                onChange={(event) =>
+                onChange={(event) => {
+                  const groupId = event.target.value;
                   setCollectionJobForm((current) => ({
                     ...current,
-                    groupId: event.target.value,
-                  }))
-                }
+                    groupId,
+                  }));
+                  setApiTargetForm(
+                    resolveApiTargetForm(options, collectionJobForm.accountId, groupId),
+                  );
+                }}
               >
-                <option value="">选择群聊</option>
+                <option value="">＋ 新增群聊</option>
                 {visibleCollectionGroups.map((group) => (
                   <option key={group.id} value={group.id}>
                     {group.name}
@@ -1462,130 +1670,152 @@ function App() {
               />
             </label>
 
-            <label>
-              <span>采集文件</span>
-              <select
-                value={collectionJobForm.sourceFile}
-                onChange={(event) =>
-                  setCollectionJobForm((current) => ({
-                    ...current,
-                    sourceFile: event.target.value,
-                  }))
-                }
-              >
-                <option value="">选择 data/imports 中的文件</option>
-                {importFiles.map((file) => (
-                  <option key={file.relative_path} value={file.relative_path}>
-                    {file.name} · {formatFileSize(file.size)} · {file.modified_at}
-                  </option>
-                ))}
-              </select>
-            </label>
+            <section className="api-collection-box">
+              <h3>API 采集配置</h3>
 
-            <button
-              className="icon-button full-width-button"
-              type="button"
-              onClick={createCollectionJob}
-              disabled={jobLoading}
-            >
-              <Clock size={16} aria-hidden="true" />
-              创建空任务
-            </button>
+              <label>
+                <span>账号显示名称</span>
+                <input
+                  value={apiTargetForm.accountName}
+                  onChange={(event) =>
+                    setApiTargetForm((current) => ({
+                      ...current,
+                      accountName: event.target.value,
+                    }))
+                  }
+                  placeholder="例如：微博账号 A"
+                />
+              </label>
 
-            <button
-              className="secondary-button full-width-button"
-              type="button"
-              onClick={runSingleGroupFileCollection}
-              disabled={jobLoading}
-            >
-              <Database size={16} aria-hidden="true" />
-              执行文件采集
-            </button>
+              <label>
+                <span>群聊名称</span>
+                <input
+                  value={apiTargetForm.groupName}
+                  onChange={(event) =>
+                    setApiTargetForm((current) => ({
+                      ...current,
+                      groupName: event.target.value,
+                    }))
+                  }
+                  placeholder="微博中显示的群名"
+                />
+              </label>
 
-            <p className="form-hint">
-              文件采集会读取 data/imports 下的 JSON/CSV，按所选时间段入库，并复制本地附件原件。
-            </p>
+              <label>
+                <span>微博群 ID</span>
+                <input
+                  inputMode="numeric"
+                  value={apiTargetForm.sourceGroupId}
+                  onChange={(event) =>
+                    setApiTargetForm((current) => ({
+                      ...current,
+                      sourceGroupId: event.target.value,
+                    }))
+                  }
+                  placeholder="query_messages 请求中的 id"
+                />
+              </label>
 
-            <section className="capture-box">
-              <h3>滚动快照</h3>
-              <div className="stacked-buttons">
-                <button
-                  className="secondary-button"
-                  type="button"
-                  onClick={generateBrowserCaptureSnippet}
-                  disabled={jobLoading}
-                >
-                  <FileText size={16} aria-hidden="true" />
-                  生成滚动脚本
-                </button>
-                <button
-                  className="secondary-button"
-                  type="button"
-                  onClick={copyBrowserCaptureSnippet}
-                  disabled={!browserCaptureSnippet}
-                >
-                  复制脚本
-                </button>
-              </div>
-              {browserCaptureSnippet ? (
-                <textarea readOnly rows={6} value={browserCaptureSnippet} />
-              ) : null}
-              <p className="form-hint">
-                脚本会在微博群聊页向上滚动加载历史消息，适合一次采集一周内的大量聊天记录。
-              </p>
               <button
-                className="secondary-button full-width-button no-side-margin"
+                className="secondary-button full-width-button"
                 type="button"
-                onClick={() => void loadBrowserCaptures()}
+                onClick={saveApiTarget}
+                disabled={jobLoading}
               >
-                刷新快照
+                <Save size={16} aria-hidden="true" />
+                保存账号与群 ID
               </button>
-              <div className="capture-list">
-                {browserCaptures.slice(0, 3).map((capture) => (
-                  <article key={capture.id}>
-                    <strong>#{capture.id} {capture.group_name}</strong>
-                    <span>{capture.captured_at}</span>
-                    <span>{capture.text_length} 字符</span>
-                    <button
-                      className="secondary-button compact-button"
-                      type="button"
-                      onClick={() => void previewBrowserCapture(capture.id)}
-                      disabled={jobLoading}
-                    >
-                      解析预览
-                    </button>
-                  </article>
-                ))}
+
+              <label>
+                <span>账号 Cookie 文件</span>
+                <input
+                  type="file"
+                  accept="application/json,.json"
+                  onChange={(event) => {
+                    void importAccountCookies(event.target.files?.[0]);
+                    event.currentTarget.value = "";
+                  }}
+                  disabled={jobLoading || !collectionJobForm.accountId}
+                />
+              </label>
+
+              <div className="api-readiness">
+                <span
+                  className={
+                    selectedCollectionAccount?.cookie_profile?.authenticated ? "ready" : "missing"
+                  }
+                >
+                  Cookie{
+                    selectedCollectionAccount?.cookie_profile?.authenticated
+                      ? " 已就绪"
+                      : " 未就绪"
+                  }
+                </span>
+                <span className={selectedCollectionGroup?.source_group_id ? "ready" : "missing"}>
+                  群 ID {selectedCollectionGroup?.source_group_id ? "已绑定" : "未绑定"}
+                </span>
               </div>
-              {browserCapturePreview ? (
-                <div className="capture-preview">
-                  <div className="capture-preview-header">
-                    <strong>快照 #{browserCapturePreview.capture_id}</strong>
-                    <span>
-                      {browserCapturePreview.parsed_count} 条 / 重复 {browserCapturePreview.duplicate_count} 条
-                    </span>
-                  </div>
-                  <div className="capture-preview-list">
-                    {browserCapturePreview.items.slice(0, 5).map((item) => (
-                      <article key={item.source_message_id}>
-                        <span>{item.sent_at}</span>
-                        <strong>{item.sender_name}</strong>
-                        <p>{item.content_text}</p>
-                        {item.is_duplicate ? <em>已存在</em> : null}
-                      </article>
-                    ))}
-                  </div>
-                  <button
-                    className="icon-button full-width-button no-side-margin"
-                    type="button"
-                    onClick={() => void importBrowserCapture()}
-                    disabled={jobLoading || browserCapturePreview.parsed_count <= 0}
-                  >
-                    确认入库
-                  </button>
-                </div>
-              ) : null}
+
+              {cookieFileName ? <p className="form-hint">最近导入：{cookieFileName}</p> : null}
+
+              <button
+                className="icon-button full-width-button"
+                type="button"
+                onClick={runWeiboApiCollection}
+                disabled={jobLoading}
+              >
+                <RefreshCw size={16} aria-hidden="true" />
+                {jobLoading ? "正在采集…" : "开始 API 采集"}
+              </button>
+
+              <p className="form-hint">
+                Cookie 只保存在本机 data/auth，并按账号隔离；群 ID 首次从 auto 捕获的
+                query_messages 请求中取得。
+              </p>
             </section>
+
+            <details className="legacy-tools">
+              <summary>备用：文件导入</summary>
+              <label>
+                <span>采集文件</span>
+                <select
+                  value={collectionJobForm.sourceFile}
+                  onChange={(event) =>
+                    setCollectionJobForm((current) => ({
+                      ...current,
+                      sourceFile: event.target.value,
+                    }))
+                  }
+                >
+                  <option value="">选择 data/imports 中的文件</option>
+                  {importFiles.map((file) => (
+                    <option key={file.relative_path} value={file.relative_path}>
+                      {file.name} · {formatFileSize(file.size)} · {file.modified_at}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <button
+                className="secondary-button full-width-button"
+                type="button"
+                onClick={runSingleGroupFileCollection}
+                disabled={jobLoading}
+              >
+                <Database size={16} aria-hidden="true" />
+                执行文件采集
+              </button>
+
+              <button
+                className="secondary-button full-width-button"
+                type="button"
+                onClick={createCollectionJob}
+                disabled={jobLoading}
+              >
+                <Clock size={16} aria-hidden="true" />
+                仅创建空任务
+              </button>
+            </details>
           </aside>
 
           <section className="job-list-panel">

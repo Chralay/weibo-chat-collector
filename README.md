@@ -1,153 +1,164 @@
 # Weibo Chat Collector
 
-微博群聊聊天记录归档与检索工具。
+微博群聊消息的本地采集、归档、检索和管理工具。当前主线方案保留 collector 项目的多账号、群聊配置、SQLite 落库、搜索和删除能力，并使用微博 Web 端内部 JSON 接口代替网页 DOM 作为主要采集来源。
 
-## 当前需求版本
+## 当前架构
 
-本项目用于把两个微博账号各自对应的微博群聊记录收集到同一个本地数据库中。采集范围不再限定指定用户，而是记录群聊中所有用户的发言和可保存的附件内容；红包等无整理价值或不需要保存的系统/交易类消息需要过滤。
+`weibo-chat-collector` 是主项目，负责：
 
-采集方式也从“每天自动收集”调整为“用户选择一个时间段后，系统自动收集该时间段内的群聊消息”。后续可以再增加定时任务，但首版不以每天自动任务为核心。
+- 管理多个微博账号及其群聊。
+- 按用户指定的开始、结束时间采集消息。
+- 将所有账号、群聊的消息统一写入同一个 SQLite 数据库，同时保留账号和群聊维度。
+- 过滤红包消息，去重，并保存可识别的图片、链接、视频等附件记录。
+- 提供消息检索、筛选、详情、软删除、回收站和批量删除。
+- 保留 JSON/CSV 文件导入作为备用采集方式。
 
-## 核心目标
+`weibo-chat-auto` 现在只作为初始化辅助工具：
 
-- 支持两个微博账号。
-- 每个微博账号可绑定一个或多个微博群聊，当前预期是两个账号分别对应两个群聊。
-- 两个账号、两个群聊的数据统一存入同一个数据库。
-- 数据库中必须保留账号维度和群聊维度，避免不同账号、不同群聊的数据混在一起。
-- 记录所有用户发言，不只记录指定用户。
-- 过滤红包类消息。
-- 支持按用户选择的时间段自动收集历史群聊消息。
-- 支持保存文字、图片、文件、链接等消息内容。
-- 支持搜索、筛选、查看详情。
-- 支持批量删除聊天记录。
+1. 为每个微博账号扫码登录并生成 `cookies.json`。
+2. 在该账号打开目标群聊时，帮助找到 `query_messages.json` 请求中的 `id`，即微博群 ID。
 
-## 优先级调整
+auto 的归档、查看器和 AI 分析流程不作为 collector 的数据主链路，也不会与 collector 共用数据库。
 
-首版优先：
+```text
+auto 扫码登录 -> cookies.json ----+
+                                  +-> collector 配置账号/群聊 -> 按时间段调用 API -> SQLite
+query_messages 请求 -> 群 ID -----+
+```
 
-- 多微博账号配置。
-- 群聊配置。
-- 时间段采集。
-- 全员消息归档。
-- 图片、文件、链接附件入库。
-- 搜索和基础筛选。
-- 批量删除。
+详细操作见 [docs/weibo-api-collection.md](docs/weibo-api-collection.md)。
 
-后续再做：
+## 安全约束
 
-- 上下文查看。
-- 统计仪表盘。
-- 采集日志、导出、备份等增强功能。
+- 每个账号的 Cookie 独立保存为 `data/auth/account-<id>.cookies.json`。
+- Cookie 内容不写入数据库；数据库只保存不敏感的登录配置文件名。
+- POSIX 系统把 Cookie 目录/文件权限强制设为 `0700`/`0600`，`data/auth/` 已加入 `.gitignore`；Windows 使用当前用户目录继承的 ACL，需确保其他本机用户无权读取项目目录。
+- 状态接口只返回文件是否存在、是否包含可发送到 API 域且未在客户端判定过期的非空 `SUB`、Cookie 数量和更新时间，不返回 Cookie 值；服务端登录态是否仍有效由实际 API 请求确认。
+- 不要把 `cookies.json`、Cookie、Token、Authorization 或账号密码提交到 Git、聊天记录、Issue 或日志。
+- 服务默认只监听 `127.0.0.1`；不要把带有 Cookie 导入能力的本地 API 暴露到公网。
 
-已取消：
+## 运行要求
 
-- 手动补充上下文表单。
-- 只采集指定用户发言。
-- 固定每天自动采集。
+- Python `>= 3.10`，推荐 Python `3.12`。
+- Node.js `>= 18`，用于前端开发服务器。
+- 从本项目根目录执行下面的命令；数据库、附件、导入文件和鉴权目录均相对项目根解析，不依赖当前 shell 的其他目录。
 
-## 第 8 点可行性结论
+### 后端：固定使用 8000 端口
 
-“两个微博号、两个微博群聊、分别获取并放在同一个数据库中”在系统设计上可以满足。
+macOS / Linux：
 
-真正需要确认的是微博侧数据获取方式：
+```bash
+python3.12 -m venv .venv
+.venv/bin/python -m pip install -r backend/requirements.txt
+.venv/bin/python -m uvicorn app.main:app --reload --app-dir backend --host 127.0.0.1 --port 8000
+```
 
-- 如果微博提供可用的官方接口、导出能力或授权方式，项目可以按合规接口实现。
-- 如果没有官方群聊历史接口，则只能做手动导入、半自动浏览器辅助采集或其他用户授权下的本地采集适配器。
-- 自动化访问微博页面和批量抓取内容存在平台规则风险，必须避免绕过登录、安全验证、权限控制或高频请求。
-- 首版建议先设计数据结构和导入流程，同时预留采集适配器接口；等实机验证后再确定最终采集方式。
+如果系统命令是 `python3`，可将第一行的 `python3.12` 替换为 `python3`，但应先确认版本不低于 3.10。Windows 所需的 IANA 时区数据已通过 `backend/requirements.txt` 的条件依赖安装。
 
-详细说明见 [docs/feasibility-and-boundaries.md](docs/feasibility-and-boundaries.md)。
+Windows PowerShell：
 
-## 文档目录
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r .\backend\requirements.txt
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --app-dir .\backend --host 127.0.0.1 --port 8000
+```
 
-- [docs/requirements.md](docs/requirements.md)：重规划后的需求清单。
-- [docs/data-model.md](docs/data-model.md)：支持多账号、多群聊、附件和批量删除的数据模型。
-- [docs/todo.md](docs/todo.md)：新版开发待办。
-- [docs/feasibility-and-boundaries.md](docs/feasibility-and-boundaries.md)：微博数据获取方式与边界确认。
-- [docs/implementation-plan.md](docs/implementation-plan.md)：从 0 到完成的实施步骤。
-- [docs/project-decisions.md](docs/project-decisions.md)：当前已确认的项目决策。
-- [docs/current-status.md](docs/current-status.md)：当前做到哪一步、下一步做什么、技术栈说明。
-- [docs/handoff.md](docs/handoff.md)：跨会话继续项目的交接说明和提示词。
-- [docs/run-and-debug.md](docs/run-and-debug.md)：如何启动前后端、何时开始调试、微博侧需要准备哪些信息。
-- [docs/step-3-integration.md](docs/step-3-integration.md)：第三步消息列表和搜索完成后的前后端联调流程。
-- [docs/message-api.md](docs/message-api.md)：消息列表、详情和筛选项 API 说明。
-- [docs/recycle-bin.md](docs/recycle-bin.md)：回收站、恢复和彻底删除说明。
-- [docs/collection-jobs.md](docs/collection-jobs.md)：时间段采集任务框架说明。
-- [docs/weibo-verification.md](docs/weibo-verification.md)：微博实机验证记录和采集适配器准备说明。
-- [docs/single-group-collection.md](docs/single-group-collection.md)：单群聊文件采集说明。
-- [docs/browser-capture.md](docs/browser-capture.md)：网页版微博页面快照采集说明。
+后端启动时会初始化所需数据库表。检查地址：
+
+- 健康检查：<http://127.0.0.1:8000/health>
+- API 文档：<http://127.0.0.1:8000/docs>
+
+### 前端：另一个终端
+
+仍从项目根目录执行：
+
+```bash
+npm --prefix frontend install
+npm --prefix frontend run dev
+```
+
+打开 <http://127.0.0.1:5173>。Vite 开发服务器会把 `/api` 和 `/health` 统一代理到 `http://127.0.0.1:8000`，因此无需修改前端 API 地址。
+
+## 首次配置与采集
+
+对每个微博账号分别执行以下流程：
+
+1. 在相邻的 `weibo-chat-auto` 项目中扫码登录，取得该账号的 `cookies.json`。
+2. 打开目标群聊，从 `query_messages.json` 网络请求的查询参数 `id` 取得群 ID。
+3. 在 collector 的“采集任务”页填写账号显示名称、群聊名称和微博群 ID，点击“保存账号与群 ID”。
+4. 确认当前选择的是对应账号，然后导入该账号的 `cookies.json`。
+5. 选择开始时间和结束时间，点击“开始 API 采集”。
+6. 在采集任务列表确认结果，再到消息页检索入库记录。
+
+第二个账号必须重新扫码并把新生成的 `cookies.json` 导入到第二个 collector 账号，不能复用第一个账号的 Cookie 文件。
+
+## API 采集行为
+
+主入口是：
+
+```text
+POST /api/collection-jobs/weibo-api
+```
+
+请求体示例：
+
+```json
+{
+  "account_id": 1,
+  "group_id": 1,
+  "range_start": "2026-08-01 00:00:00",
+  "range_end": "2026-08-01 23:59:59"
+}
+```
+
+- `range_start` 必须早于 `range_end`。
+- 服务从新消息向旧消息分页，覆盖开始边界后停止，只入库 `range_start <= sent_at <= range_end` 的消息。
+- 如果页数上限耗尽但仍未覆盖开始边界，任务会失败，不会把不完整结果伪装成成功。
+- 超时、HTTP `429` 和 `5xx` 使用有上限的退避重试；默认额外重试 2 次，即最多尝试 3 次。
+- 登录失效、群不可访问、限流、响应异常、分页异常和网络失败都会明确返回错误。已经创建的任务会标记为 `failed` 并记录错误信息，不静默跳过。
+- 同一账号同一时间只允许一个 API 采集任务运行。
+
+可通过项目根目录的 `.env` 调整页大小、最大页数、页间延迟、超时和重试参数，示例见 [.env.example](.env.example)。
+
+## 备用采集方式
+
+- JSON/CSV 文件导入继续保留，可在“采集任务”页的“备用：文件导入”中使用，也可运行 `scripts/import_messages.py`。
+- 网页快照相关历史代码和数据继续保留用于研究；当前后端 CORS 只允许本地前端来源，加上浏览器 Private Network Access 和页面安全策略已收紧，从微博页面跨域回传本机快照不再作为推荐主流程。
+
+## 重要限制
+
+collector 当前调用的是从微博 Web 客户端行为中观察到的内部接口：
+
+```text
+https://api.weibo.com/webim/groupchat/query_messages.json
+```
+
+它不是公开、受支持或保证稳定的官方 API，字段、鉴权、分页方式和可用性都可能在没有通知的情况下改变。使用时应遵守微博服务条款、账号权限和适用法律，控制请求频率，并仅采集有权访问的数据。
+
+当前实现已有本地自动化测试，但尚未声称已用真实微博账号完成端到端 API 验证。尤其是图片、文件、链接、视频等附件字段仍需用真实且脱敏的响应确认；现阶段主要保存从已知字段映射出的附件 URL/元数据，不代表附件原件已成功下载。
+
+## 文档
+
+- [docs/weibo-api-collection.md](docs/weibo-api-collection.md)：API 采集架构、安全约束和完整操作流程。
+- [docs/current-status.md](docs/current-status.md)：当前完成度、验证边界和下一步。
 - [docs/import-format.md](docs/import-format.md)：JSON/CSV 手动导入格式。
-- [docs/screenshot-analysis.md](docs/screenshot-analysis.md)：附件截图分析。
+- [docs/message-api.md](docs/message-api.md)：消息列表、详情和筛选接口。
+- [docs/collection-jobs.md](docs/collection-jobs.md)：通用采集任务框架。
+- [docs/single-group-collection.md](docs/single-group-collection.md)：备用的单群聊文件采集。
+- [docs/browser-capture.md](docs/browser-capture.md)：非主流程的网页快照说明。
+- [docs/recycle-bin.md](docs/recycle-bin.md)：回收站、恢复和彻底删除。
 
-## 当前项目结构
+## 项目结构
 
 ```text
 weibo-chat-collector/
-  backend/              # FastAPI 后端
+  backend/              # FastAPI 后端和采集器
   frontend/             # React + Vite 前端
   data/
-    attachments/        # 图片和文件原件保存目录
-    imports/            # 手动导入文件目录
-  docs/                 # 需求和实施文档
-  scripts/              # 数据库初始化和维护脚本
-```
-
-## 初始化数据库
-
-如果本机有 Python：
-
-```powershell
-python .\scripts\init_db.py --seed-placeholders
-```
-
-如果使用 Codex 桌面自带 Python，可按实际路径运行：
-
-```powershell
-& 'C:\Users\SethJ\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' .\scripts\init_db.py --seed-placeholders
-```
-
-检查数据库：
-
-```powershell
-python .\scripts\inspect_db.py
-```
-
-## 手动导入消息
-
-JSON 示例：
-
-```powershell
-python .\scripts\import_messages.py .\data\imports\sample-import.json
-```
-
-CSV 示例：
-
-```powershell
-python .\scripts\import_messages.py .\data\imports\sample-import.csv
-```
-
-导入时会自动创建账号、群聊、用户和群成员，跳过红包消息，并对重复消息去重。
-
-## 后端开发
-
-```powershell
-cd backend
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-uvicorn app.main:app --reload
-```
-
-健康检查地址：
-
-```text
-http://127.0.0.1:8000/health
-```
-
-## 前端开发
-
-```powershell
-cd frontend
-npm install
-npm run dev
+    auth/               # 按账号隔离的 Cookie，仅本机保存且不进 Git
+    attachments/        # 附件原件目录
+    imports/            # JSON/CSV 备用导入目录
+    weibo_chat_collector.sqlite3
+  docs/
+  scripts/
 ```

@@ -282,6 +282,71 @@ button:disabled {
   margin: 12px 14px 0;
 }
 
+.api-collection-box {
+  background: #f7fbfa;
+  border: 1px solid #cfe3df;
+  border-radius: 8px;
+  margin: 16px 14px 0;
+  padding: 12px;
+}
+
+.api-collection-box h3 {
+  font-size: 14px;
+  margin: 0;
+}
+
+.api-collection-box label,
+.legacy-tools label {
+  padding: 12px 0 0;
+}
+
+.api-collection-box .full-width-button,
+.legacy-tools .full-width-button {
+  margin: 12px 0 0;
+  width: 100%;
+}
+
+.api-collection-box .form-hint {
+  margin-left: 0;
+  margin-right: 0;
+}
+
+.api-readiness {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+.api-readiness span {
+  border-radius: 999px;
+  font-size: 12px;
+  padding: 5px 8px;
+}
+
+.api-readiness .ready {
+  background: #dff3e9;
+  color: #176144;
+}
+
+.api-readiness .missing {
+  background: #fff0dd;
+  color: #815500;
+}
+
+.legacy-tools {
+  border-top: 1px solid #edf1f3;
+  margin: 16px 14px 0;
+  padding-top: 12px;
+}
+
+.legacy-tools summary {
+  color: #4f5b66;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+}
+
 .no-side-margin {
   margin-left: 0;
   margin-right: 0;
