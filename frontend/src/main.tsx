@@ -18,6 +18,7 @@ import "./styles.css";
 
 const API_BASE_URL = "";
 const PAGE_SIZE = 100;
+const COLLECTION_JOB_PAGE_SIZE = 50;
 
 type Account = {
   id: number;
@@ -123,7 +124,7 @@ type ActionPreview = DeletePreview & {
   action: PreviewAction;
 };
 
-type ViewMode = "active" | "deleted" | "jobs" | "weibo";
+type ViewMode = "active" | "deleted" | "jobs" | "monitor" | "tools" | "weibo";
 
 type CollectionJob = {
   id: number;
@@ -143,6 +144,44 @@ type CollectionJob = {
   error_message: string | null;
   collector_type: string;
   created_at: string;
+  next_max_mid: string | number | null;
+  checkpoint_oldest_at: string | null;
+  page_count: number;
+  attempt_count: number;
+  duplicate_count: number;
+  filtered_red_packet_count: number;
+  filtered_system_notice_count: number;
+  stop_code: string | null;
+  stop_reason: string | null;
+  last_http_status: number | null;
+  last_error_code: string | null;
+  stop_requested_at: string | null;
+  resume_not_before: string | null;
+  last_progress_at: string | null;
+  queue_position: number | null;
+};
+
+type CollectionJobAttempt = {
+  id: number;
+  job_id: number;
+  attempt_no: number;
+  status: string;
+  start_max_mid: string;
+  end_max_mid: string | null;
+  started_at: string;
+  finished_at: string | null;
+  page_count: number;
+  total_seen_count: number;
+  inserted_count: number;
+  skipped_count: number;
+  duplicate_count: number;
+  filtered_red_packet_count: number;
+  filtered_system_notice_count: number;
+  failed_count: number;
+  stop_code: string | null;
+  stop_reason: string | null;
+  last_http_status: number | null;
+  last_error_code: string | null;
 };
 
 type CollectionJobForm = {
@@ -173,6 +212,7 @@ type SingleGroupCollectionSummary = {
   inserted_count: number;
   skipped_count: number;
   red_packet_count: number;
+  filtered_system_notice_count: number;
   duplicate_count: number;
   attachment_count: number;
   out_of_range_count: number;
@@ -224,6 +264,7 @@ type BrowserCaptureImportResult = {
   skipped_count: number;
   duplicate_count: number;
   red_packet_count: number;
+  filtered_system_notice_count: number;
   collection_job: CollectionJob;
 };
 
@@ -410,6 +451,14 @@ function formatDateTimeLocal(value: string): string {
   return normalized.length === 16 ? `${normalized}:00` : normalized;
 }
 
+function isFutureUtcTimestamp(value: string | null): boolean {
+  if (!value) return false;
+  const normalized = value.includes("T") ? value : value.replace(" ", "T");
+  const utcValue = /(?:Z|[+-]\d{2}:\d{2})$/.test(normalized) ? normalized : `${normalized}Z`;
+  const timestamp = Date.parse(utcValue);
+  return Number.isFinite(timestamp) && timestamp > Date.now();
+}
+
 async function fetchJson<T>(path: string, label: string, init?: RequestInit): Promise<T> {
   const url = `${API_BASE_URL}${path}`;
   const maxAttempts = init?.method && init.method !== "GET" ? 1 : 2;
@@ -426,7 +475,15 @@ async function fetchJson<T>(path: string, label: string, init?: RequestInit): Pr
       }
 
       const body = await response.text().catch(() => "");
-      const detail = body.trim().slice(0, 200);
+      let detail = body.trim().slice(0, 200);
+      if (body) {
+        try {
+          const parsed = JSON.parse(body) as { detail?: unknown };
+          if (typeof parsed.detail === "string") detail = parsed.detail.slice(0, 200);
+        } catch {
+          // Keep the bounded plain-text body when the response is not JSON.
+        }
+      }
       if (attempt < maxAttempts && response.status >= 500) {
         await new Promise((resolve) => window.setTimeout(resolve, 300));
         continue;
@@ -528,6 +585,19 @@ function formatFileSize(size: number): string {
   return `${(size / 1024 / 1024).toFixed(1)} MB`;
 }
 
+function formatCollectionStatus(status: string): string {
+  const labels: Record<string, string> = {
+    queued: "排队中",
+    awaiting_confirmation: "待确认",
+    running: "采集中",
+    stopped: "已停止",
+    completed: "已完成",
+    cancelled: "已取消",
+    failed: "失败",
+  };
+  return labels[status] ?? status;
+}
+
 function parseJsonText(value: string, label: string): unknown {
   const trimmed = value.trim();
   if (!trimmed) return null;
@@ -580,6 +650,7 @@ function App() {
   const [deleting, setDeleting] = useState(false);
   const [collectionJobs, setCollectionJobs] = useState<CollectionJob[]>([]);
   const [collectionJobTotal, setCollectionJobTotal] = useState(0);
+  const [collectionJobOffset, setCollectionJobOffset] = useState(0);
   const [collectionJobForm, setCollectionJobForm] = useState<CollectionJobForm>(
     emptyCollectionJobForm,
   );
@@ -592,6 +663,10 @@ function App() {
   const [browserCapturePreview, setBrowserCapturePreview] =
     useState<BrowserCaptureParsePreview | null>(null);
   const [jobLoading, setJobLoading] = useState(false);
+  const [jobActionId, setJobActionId] = useState<number | null>(null);
+  const [expandedJobId, setExpandedJobId] = useState<number | null>(null);
+  const [attemptLoadingJobId, setAttemptLoadingJobId] = useState<number | null>(null);
+  const [jobAttempts, setJobAttempts] = useState<Record<number, CollectionJobAttempt[]>>({});
   const [jobMessage, setJobMessage] = useState<string | null>(null);
   const [verificationReports, setVerificationReports] = useState<WeiboVerificationReport[]>([]);
   const [verificationTotal, setVerificationTotal] = useState(0);
@@ -851,12 +926,17 @@ function App() {
     }
   }
 
-  async function loadCollectionJobs(status = collectionJobStatusFilter) {
-    setJobLoading(true);
-    setError(null);
+  async function loadCollectionJobs(
+    status = collectionJobStatusFilter,
+    quiet = false,
+    offset = collectionJobOffset,
+  ) {
+    if (!quiet) setJobLoading(true);
+    if (!quiet) setError(null);
     try {
       const params = new URLSearchParams();
-      params.set("limit", "50");
+      params.set("limit", String(COLLECTION_JOB_PAGE_SIZE));
+      params.set("offset", String(offset));
       if (status) params.set("status", status);
       const data = await fetchJson<{
         items: CollectionJob[];
@@ -864,10 +944,40 @@ function App() {
       }>(`/api/collection-jobs?${params.toString()}`, "采集任务加载");
       setCollectionJobs(data.items);
       setCollectionJobTotal(data.total);
+      setCollectionJobOffset(offset);
+      if (expandedJobId !== null) {
+        const attempts = await fetchJson<{ items: CollectionJobAttempt[] }>(
+          `/api/collection-jobs/${expandedJobId}/attempts`,
+          "采集运行记录刷新",
+        );
+        setJobAttempts((current) => ({ ...current, [expandedJobId]: attempts.items }));
+      }
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "请求失败");
     } finally {
-      setJobLoading(false);
+      if (!quiet) setJobLoading(false);
+    }
+  }
+
+  async function toggleCollectionJobAttempts(jobId: number) {
+    if (expandedJobId === jobId) {
+      setExpandedJobId(null);
+      return;
+    }
+    setExpandedJobId(jobId);
+    if (jobAttempts[jobId]) return;
+
+    setAttemptLoadingJobId(jobId);
+    try {
+      const data = await fetchJson<{ items: CollectionJobAttempt[] }>(
+        `/api/collection-jobs/${jobId}/attempts`,
+        "采集运行记录加载",
+      );
+      setJobAttempts((current) => ({ ...current, [jobId]: data.items }));
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "运行记录加载失败");
+    } finally {
+      setAttemptLoadingJobId(null);
     }
   }
 
@@ -993,7 +1103,7 @@ function App() {
         },
       );
       setJobMessage(
-        `已入库 ${result.inserted_count} 条，跳过 ${result.skipped_count} 条，重复 ${result.duplicate_count} 条`,
+        `已入库 ${result.inserted_count} 条，跳过 ${result.skipped_count} 条，重复 ${result.duplicate_count} 条，红包 ${result.red_packet_count} 条，系统通知 ${result.filtered_system_notice_count} 条`,
       );
       setBrowserCapturePreview(null);
       await loadBrowserCaptures();
@@ -1096,7 +1206,7 @@ function App() {
     }
   }
 
-  async function runWeiboApiCollection() {
+  async function createWeiboApiJob() {
     setJobLoading(true);
     setJobMessage(null);
     setError(null);
@@ -1120,23 +1230,75 @@ function App() {
         }),
       });
       if (!response.ok) {
-        const errorBody = (await response.json().catch(() => null)) as { detail?: string } | null;
-        throw new Error(errorBody?.detail || "微博 API 采集失败");
+        const errorBody = (await response.json().catch(() => null)) as { detail?: unknown } | null;
+        const detail =
+          typeof errorBody?.detail === "string"
+            ? errorBody.detail
+            : "采集任务创建失败";
+        throw new Error(detail);
       }
-      const result = (await response.json()) as {
-        summary: SingleGroupCollectionSummary & { page_count?: number };
-      };
-      setJobMessage(
-        `API 采集完成：新增 ${result.summary.inserted_count}，跳过 ${result.summary.skipped_count}，红包 ${result.summary.red_packet_count}，附件 ${result.summary.attachment_count}`,
-      );
-      await loadCollectionJobs();
-      await loadOptions();
-      await loadMessages(appliedFilters);
+      const created = (await response.json()) as CollectionJob;
+      setJobMessage(`采集任务 #${created.id} 已进入全局队列`);
+      setCollectionJobStatusFilter("");
+      await loadCollectionJobs("", false, 0);
+      setViewMode("monitor");
     } catch (requestError) {
+      await loadCollectionJobs(collectionJobStatusFilter, true, collectionJobOffset).catch(
+        () => undefined,
+      );
       setError(requestError instanceof Error ? requestError.message : "请求失败");
-      await loadCollectionJobs().catch(() => undefined);
     } finally {
       setJobLoading(false);
+    }
+  }
+
+  async function runCollectionJobAction(
+    job: CollectionJob,
+    action: "confirm" | "resume" | "stop",
+  ) {
+    if (
+      action === "confirm" &&
+      !window.confirm("请先关闭微博 App 和所有微博网页。确认已经关闭后再启动采集？")
+    ) {
+      return;
+    }
+    if (
+      action === "stop" &&
+      !window.confirm(
+        job.status === "running"
+          ? "安全停止会等待当前请求和当前页提交完成，确认停止？"
+          : "确认将这个任务移出等待队列？之后仍可沿原断点重新排队。",
+      )
+    ) {
+      return;
+    }
+
+    setJobActionId(job.id);
+    setJobMessage(null);
+    setError(null);
+    try {
+      const actionLabel =
+        action === "confirm" ? "确认启动" : action === "resume" ? "续传" : "安全停止";
+      await fetchJson<CollectionJob>(`/api/collection-jobs/${job.id}/${action}`, actionLabel, {
+        method: "POST",
+      });
+      setJobMessage(
+        action === "confirm"
+          ? `任务 #${job.id} 已确认启动`
+          : action === "resume"
+            ? `任务 #${job.id} 已沿断点重新排队`
+            : `任务 #${job.id} 已提交安全停止请求`,
+      );
+      setJobAttempts((current) => {
+        const next = { ...current };
+        delete next[job.id];
+        return next;
+      });
+      await loadCollectionJobs(collectionJobStatusFilter, true, collectionJobOffset);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "任务操作失败");
+    } finally {
+      setJobActionId(null);
     }
   }
 
@@ -1213,7 +1375,7 @@ function App() {
         job: CollectionJob;
       };
       setJobMessage(
-        `已完成采集 #${result.summary.collection_job_id}：新增 ${result.summary.inserted_count}，跳过 ${result.summary.skipped_count}，红包 ${result.summary.red_packet_count}，附件 ${result.summary.attachment_count}`,
+        `已完成采集 #${result.summary.collection_job_id}：新增 ${result.summary.inserted_count}，跳过 ${result.summary.skipped_count}，红包 ${result.summary.red_packet_count}，系统通知 ${result.summary.filtered_system_notice_count}，附件 ${result.summary.attachment_count}`,
       );
       await loadCollectionJobs();
       await loadOptions();
@@ -1395,10 +1557,12 @@ function App() {
 
   async function loadJobView() {
     setError(null);
-    await loadOptions();
-    await loadCollectionJobs();
-    await loadImportFiles();
+    await Promise.all([loadOptions(), loadCollectionJobs()]);
+  }
+
+  async function loadAdvancedToolsView() {
     setError(null);
+    await Promise.all([loadOptions(), loadImportFiles(), loadBrowserCaptures()]);
   }
 
   useEffect(() => {
@@ -1425,6 +1589,14 @@ function App() {
       void loadDetail(selectedMessageId);
     }
   }, [selectedMessageId]);
+
+  useEffect(() => {
+    if (viewMode !== "monitor") return undefined;
+    const timer = window.setInterval(() => {
+      void loadCollectionJobs(collectionJobStatusFilter, true, collectionJobOffset);
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [viewMode, collectionJobStatusFilter, collectionJobOffset, expandedJobId]);
 
   function updateFilter<K extends keyof Filters>(key: K, value: Filters[K]) {
     setFilters((current) => {
@@ -1470,6 +1642,12 @@ function App() {
       void loadJobView().catch((requestError) => {
         setError(requestError instanceof Error ? requestError.message : "请求失败");
       });
+    } else if (nextViewMode === "monitor") {
+      void loadCollectionJobs();
+    } else if (nextViewMode === "tools") {
+      void loadAdvancedToolsView().catch((requestError) => {
+        setError(requestError instanceof Error ? requestError.message : "请求失败");
+      });
     } else if (nextViewMode === "weibo") {
       void loadVerificationReports();
     } else {
@@ -1484,12 +1662,16 @@ function App() {
           <h1>微博群聊归档库</h1>
           <p>
             {viewMode === "jobs"
-              ? "多账号隔离登录态，通过微博消息 API 按时间段采集并直接落库"
-              : viewMode === "weibo"
-                ? "记录微博实机验证结果和脱敏接口观察，为真实采集器做准备"
-              : viewMode === "deleted"
-                ? "回收站：查看、恢复或彻底删除已删除消息"
-                : "按日期分组展示，游标分页加载更早消息"}
+              ? "选择账号、群聊、Cookie 和时间范围，创建全局串行采集任务"
+              : viewMode === "monitor"
+                ? "查看每次采集的断点、时间覆盖、过滤计数和停止原因"
+                : viewMode === "tools"
+                  ? "导入本地 JSON/CSV 或网页快照，并维护 API 采集目标"
+                  : viewMode === "weibo"
+                    ? "记录微博实机验证结果和脱敏接口观察，为真实采集器做准备"
+                    : viewMode === "deleted"
+                      ? "回收站：查看、恢复或彻底删除已删除消息"
+                      : "按日期分组展示，游标分页加载更早消息"}
           </p>
         </div>
         <div className="header-actions">
@@ -1515,6 +1697,20 @@ function App() {
             采集任务
           </button>
           <button
+            className={viewMode === "monitor" ? "icon-button" : "secondary-button"}
+            type="button"
+            onClick={() => switchView("monitor")}
+          >
+            采集监控
+          </button>
+          <button
+            className={viewMode === "tools" ? "icon-button" : "secondary-button"}
+            type="button"
+            onClick={() => switchView("tools")}
+          >
+            高级工具 / 数据导入
+          </button>
+          <button
             className={viewMode === "weibo" ? "icon-button" : "secondary-button"}
             type="button"
             onClick={() => switchView("weibo")}
@@ -1527,6 +1723,10 @@ function App() {
             onClick={() =>
               viewMode === "jobs"
                 ? void loadJobView()
+                : viewMode === "monitor"
+                  ? void loadCollectionJobs()
+                : viewMode === "tools"
+                  ? void loadAdvancedToolsView()
                 : viewMode === "weibo"
                   ? void loadVerificationReports()
                   : void loadMessages()
@@ -1540,8 +1740,10 @@ function App() {
 
       <section className="status-row">
         <article>
-          {viewMode === "jobs" ? (
+          {viewMode === "jobs" || viewMode === "monitor" ? (
             <Clock size={18} aria-hidden="true" />
+          ) : viewMode === "tools" ? (
+            <Database size={18} aria-hidden="true" />
           ) : viewMode === "weibo" ? (
             <ShieldCheck size={18} aria-hidden="true" />
           ) : (
@@ -1549,32 +1751,44 @@ function App() {
           )}
           <span>
             {viewMode === "jobs"
-              ? `${collectionJobTotal} 个任务`
-              : viewMode === "weibo"
-                ? `${verificationTotal} 条验证记录`
-                : `${total} 条消息`}
+              ? `${options.accounts.length} 个采集账号`
+              : viewMode === "monitor"
+                ? `${collectionJobTotal} 个任务`
+                : viewMode === "tools"
+                  ? `${importFiles.length} 个待导入文件`
+                  : viewMode === "weibo"
+                    ? `${verificationTotal} 条验证记录`
+                    : `${total} 条消息`}
           </span>
         </article>
         <article>
           <CalendarDays size={18} aria-hidden="true" />
           <span>
             {viewMode === "jobs"
-              ? "严格按所选开始与结束时间过滤"
-              : viewMode === "weibo"
-                ? "先记录脱敏结构，不保存 Cookie 或 Token"
-              : viewMode === "deleted"
-                ? "当前只看已删除消息"
-                : `每次加载 ${PAGE_SIZE} 条`}
+              ? "新任务从 max_mid=0 开始"
+              : viewMode === "monitor"
+                ? "每 5 秒刷新任务进度"
+                : viewMode === "tools"
+                  ? "本地导入不占微博 API 队列"
+                  : viewMode === "weibo"
+                    ? "先记录脱敏结构，不保存 Cookie 或 Token"
+                    : viewMode === "deleted"
+                      ? "当前只看已删除消息"
+                      : `每次加载 ${PAGE_SIZE} 条`}
           </span>
         </article>
         <article>
           <Search size={18} aria-hidden="true" />
           <span>
             {viewMode === "jobs"
-              ? "API 分页采集，文件导入保留为备用"
-              : viewMode === "weibo"
-                ? "观察样例必须先脱敏"
-                : "正文与附件字段可搜索"}
+              ? "轮到任务后需确认已关闭微博 App / 网页"
+              : viewMode === "monitor"
+                ? "停止任务可沿已提交断点续传"
+                : viewMode === "tools"
+                  ? "JSON、CSV 与网页快照统一从这里导入"
+                  : viewMode === "weibo"
+                    ? "观察样例必须先脱敏"
+                    : "正文与附件字段可搜索"}
           </span>
         </article>
       </section>
@@ -1585,7 +1799,7 @@ function App() {
       {verificationMessage ? <div className="success-alert">{verificationMessage}</div> : null}
 
       {viewMode === "jobs" ? (
-        <section className="jobs-workspace">
+        <section className="collection-create-workspace">
           <aside className="job-form-panel">
             <div className="panel-title">
               <h2>创建采集任务</h2>
@@ -1609,7 +1823,7 @@ function App() {
                   setCookieFileName("");
                 }}
               >
-                <option value="">＋ 新增账号</option>
+                <option value="">选择账号</option>
                 {options.accounts.map((account) => (
                   <option key={account.id} value={account.id}>
                     {account.display_name}
@@ -1633,7 +1847,7 @@ function App() {
                   );
                 }}
               >
-                <option value="">＋ 新增群聊</option>
+                <option value="">选择群聊</option>
                 {visibleCollectionGroups.map((group) => (
                   <option key={group.id} value={group.id}>
                     {group.name}
@@ -1641,6 +1855,34 @@ function App() {
                 ))}
               </select>
             </label>
+
+            <label>
+              <span>账号 Cookie 文件</span>
+              <input
+                type="file"
+                accept="application/json,.json"
+                onChange={(event) => {
+                  void importAccountCookies(event.target.files?.[0]);
+                  event.currentTarget.value = "";
+                }}
+                disabled={jobLoading || !collectionJobForm.accountId}
+              />
+            </label>
+
+            <div className="api-readiness form-readiness">
+              <span
+                className={
+                  selectedCollectionAccount?.cookie_profile?.authenticated ? "ready" : "missing"
+                }
+              >
+                Cookie{selectedCollectionAccount?.cookie_profile?.authenticated ? " 已就绪" : " 未就绪"}
+              </span>
+              <span className={selectedCollectionGroup?.source_group_id ? "ready" : "missing"}>
+                群 ID {selectedCollectionGroup?.source_group_id ? "已绑定" : "未绑定"}
+              </span>
+            </div>
+
+            {cookieFileName ? <p className="form-hint">最近导入：{cookieFileName}</p> : null}
 
             <label>
               <span>开始时间</span>
@@ -1670,142 +1912,491 @@ function App() {
               />
             </label>
 
-            <section className="api-collection-box">
-              <h3>API 采集配置</h3>
+            <button
+              className="icon-button full-width-button"
+              type="button"
+              onClick={createWeiboApiJob}
+              disabled={jobLoading}
+            >
+              <Plus size={16} aria-hidden="true" />
+              {jobLoading ? "正在创建…" : "启动采集"}
+            </button>
 
-              <label>
-                <span>账号显示名称</span>
-                <input
-                  value={apiTargetForm.accountName}
-                  onChange={(event) =>
-                    setApiTargetForm((current) => ({
-                      ...current,
-                      accountName: event.target.value,
-                    }))
-                  }
-                  placeholder="例如：微博账号 A"
-                />
-              </label>
+            <p className="form-hint">
+              Cookie 仅保存在本机并按账号隔离。
+              任务创建后先进入全局队列，不会在当前请求里同步采集。
+            </p>
+          </aside>
 
-              <label>
-                <span>群聊名称</span>
-                <input
-                  value={apiTargetForm.groupName}
-                  onChange={(event) =>
-                    setApiTargetForm((current) => ({
-                      ...current,
-                      groupName: event.target.value,
-                    }))
-                  }
-                  placeholder="微博中显示的群名"
-                />
-              </label>
-
-              <label>
-                <span>微博群 ID</span>
-                <input
-                  inputMode="numeric"
-                  value={apiTargetForm.sourceGroupId}
-                  onChange={(event) =>
-                    setApiTargetForm((current) => ({
-                      ...current,
-                      sourceGroupId: event.target.value,
-                    }))
-                  }
-                  placeholder="query_messages 请求中的 id"
-                />
-              </label>
-
-              <button
-                className="secondary-button full-width-button"
-                type="button"
-                onClick={saveApiTarget}
-                disabled={jobLoading}
-              >
-                <Save size={16} aria-hidden="true" />
-                保存账号与群 ID
-              </button>
-
-              <label>
-                <span>账号 Cookie 文件</span>
-                <input
-                  type="file"
-                  accept="application/json,.json"
-                  onChange={(event) => {
-                    void importAccountCookies(event.target.files?.[0]);
-                    event.currentTarget.value = "";
-                  }}
-                  disabled={jobLoading || !collectionJobForm.accountId}
-                />
-              </label>
-
-              <div className="api-readiness">
-                <span
-                  className={
-                    selectedCollectionAccount?.cookie_profile?.authenticated ? "ready" : "missing"
-                  }
-                >
-                  Cookie{
-                    selectedCollectionAccount?.cookie_profile?.authenticated
-                      ? " 已就绪"
-                      : " 未就绪"
-                  }
-                </span>
-                <span className={selectedCollectionGroup?.source_group_id ? "ready" : "missing"}>
-                  群 ID {selectedCollectionGroup?.source_group_id ? "已绑定" : "未绑定"}
-                </span>
+          <section className="job-list-panel collection-guide">
+            <div className="panel-title">
+              <h2>启动前说明</h2>
+            </div>
+            <div className="guide-body">
+              <div className="risk-notice">
+                <strong>轮到任务后不会立刻请求微博</strong>
+                <p>
+                  任务会进入“待确认”状态。请关闭微博 App 和所有微博网页，
+                  再到采集监控中确认启动。
+                </p>
               </div>
-
-              {cookieFileName ? <p className="form-hint">最近导入：{cookieFileName}</p> : null}
-
-              <button
-                className="icon-button full-width-button"
-                type="button"
-                onClick={runWeiboApiCollection}
-                disabled={jobLoading}
-              >
-                <RefreshCw size={16} aria-hidden="true" />
-                {jobLoading ? "正在采集…" : "开始 API 采集"}
+              <ol>
+                <li>所有账号共用一个微博 API 队列，全局串行采集。</li>
+                <li>每页成功提交消息和断点后，才会请求下一页。</li>
+                <li>任何错误都会立即停止，不自动重试，也不会推进失败页的断点。</li>
+                <li>已停止任务可在采集监控中沿原断点人工续传。</li>
+              </ol>
+              <button className="secondary-button" type="button" onClick={() => switchView("monitor")}>
+                查看采集监控
               </button>
+            </div>
+          </section>
+        </section>
+      ) : viewMode === "monitor" ? (
+        <section className="job-list-panel monitor-workspace">
+          <div className="panel-title">
+            <h2>采集监控</h2>
+            <span>{jobLoading ? "加载中" : `${collectionJobs.length} / ${collectionJobTotal}`}</span>
+          </div>
 
-              <p className="form-hint">
-                Cookie 只保存在本机 data/auth，并按账号隔离；群 ID 首次从 auto 捕获的
-                query_messages 请求中取得。
-              </p>
-            </section>
+          <div className="job-toolbar monitor-toolbar">
+            <select
+              value={collectionJobStatusFilter}
+              onChange={(event) => {
+                setCollectionJobStatusFilter(event.target.value);
+                void loadCollectionJobs(event.target.value, false, 0);
+              }}
+            >
+              <option value="">全部状态</option>
+              <option value="queued">排队中</option>
+              <option value="awaiting_confirmation">待确认</option>
+              <option value="running">采集中</option>
+              <option value="stopped">已停止</option>
+              <option value="completed">已完成</option>
+              <option value="cancelled">已取消</option>
+              <option value="failed">失败</option>
+            </select>
+            <span>运行中自动每 5 秒刷新；进度以页数和当前最早消息时间为准。</span>
+          </div>
 
-            <details className="legacy-tools">
-              <summary>备用：文件导入</summary>
+          <div className="job-table-wrap">
+            <table className="job-table">
+              <thead>
+                <tr>
+                  <th>任务</th>
+                  <th>采集范围</th>
+                  <th>状态</th>
+                  <th>时间覆盖进度</th>
+                  <th>计数</th>
+                  <th>停止原因</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {collectionJobs.map((job) => {
+                  const stopReason = job.stop_reason || job.error_message;
+                  const cooldownActive = isFutureUtcTimestamp(job.resume_not_before);
+                  const safeStopPending = job.status === "running" && Boolean(job.stop_requested_at);
+                  const attempts = jobAttempts[job.id] ?? [];
+                  return (
+                    <React.Fragment key={job.id}>
+                    <tr>
+                      <td>
+                        <strong>#{job.id} · {job.group_name}</strong>
+                        <span>{job.account_name}</span>
+                        <small>运行 {job.attempt_count ?? 0} 次</small>
+                      </td>
+                      <td>
+                        <span>{job.range_start}</span>
+                        <span>至 {job.range_end}</span>
+                      </td>
+                      <td>
+                        <span className={`job-status status-${job.status}`}>
+                          {safeStopPending
+                            ? "安全停止中"
+                            : formatCollectionStatus(job.status)}
+                        </span>
+                        {job.queue_position ? <small>队列第 {job.queue_position} 位</small> : null}
+                        {job.last_progress_at ? <small>更新 {job.last_progress_at}</small> : null}
+                      </td>
+                      <td>
+                        <strong>{job.page_count ?? 0} 页</strong>
+                        <span>最早：{job.checkpoint_oldest_at || "尚未取得消息"}</span>
+                        <small>断点：{job.next_max_mid ?? "0"}</small>
+                      </td>
+                      <td>
+                        <span>看到 {job.total_seen_count ?? 0} · 新增 {job.inserted_count ?? 0}</span>
+                        <span>
+                          重复 {job.duplicate_count ?? job.skipped_count ?? 0} · 失败 {job.failed_count ?? 0}
+                        </span>
+                        <small>
+                          红包 {job.filtered_red_packet_count ?? 0} · 系统通知{" "}
+                          {job.filtered_system_notice_count ?? 0}
+                        </small>
+                      </td>
+                      <td>
+                        {job.stop_code ? <strong>{job.stop_code}</strong> : null}
+                        <span>{stopReason || "—"}</span>
+                        {job.last_http_status ? <small>HTTP {job.last_http_status}</small> : null}
+                        {job.last_error_code ? <small>API {job.last_error_code}</small> : null}
+                        {job.resume_not_before ? (
+                          <small>
+                            风控冷却至 {job.resume_not_before}
+                            {cooldownActive ? "（期间不可续传）" : "（已结束，可人工续传）"}
+                          </small>
+                        ) : null}
+                      </td>
+                      <td>
+                        <div className="job-actions">
+                          {job.status === "awaiting_confirmation" ? (
+                            <>
+                              <button
+                                className="icon-button compact-button"
+                                type="button"
+                                disabled={jobActionId === job.id}
+                                onClick={() => void runCollectionJobAction(job, "confirm")}
+                              >
+                                确认并启动
+                              </button>
+                              <button
+                                className="secondary-button compact-button"
+                                type="button"
+                                disabled={jobActionId === job.id}
+                                onClick={() => void runCollectionJobAction(job, "stop")}
+                              >
+                                暂停等待
+                              </button>
+                            </>
+                          ) : null}
+                          {job.status === "queued" ? (
+                            <button
+                              className="secondary-button compact-button"
+                              type="button"
+                              disabled={jobActionId === job.id}
+                              onClick={() => void runCollectionJobAction(job, "stop")}
+                            >
+                              移出队列
+                            </button>
+                          ) : null}
+                          {job.status === "running" ? (
+                            <button
+                              className="secondary-button compact-button"
+                              type="button"
+                              disabled={jobActionId === job.id || safeStopPending}
+                              onClick={() => void runCollectionJobAction(job, "stop")}
+                            >
+                              {safeStopPending ? "正在安全停止" : "安全停止"}
+                            </button>
+                          ) : null}
+                          {job.status === "stopped" ? (
+                            <button
+                              className="secondary-button compact-button"
+                              type="button"
+                              disabled={jobActionId === job.id || cooldownActive}
+                              onClick={() => void runCollectionJobAction(job, "resume")}
+                              title={cooldownActive ? "风控冷却结束后仍需人工续传" : undefined}
+                            >
+                              {cooldownActive ? "冷却中" : "沿断点续传"}
+                            </button>
+                          ) : null}
+                          {!["queued", "awaiting_confirmation", "running", "stopped"].includes(job.status) ? (
+                            <span className="muted">无操作</span>
+                          ) : null}
+                          {job.attempt_count > 0 ? (
+                            <button
+                              className="secondary-button compact-button"
+                              type="button"
+                              disabled={attemptLoadingJobId === job.id}
+                              onClick={() => void toggleCollectionJobAttempts(job.id)}
+                            >
+                              {expandedJobId === job.id ? "收起运行记录" : "查看每次运行"}
+                            </button>
+                          ) : null}
+                        </div>
+                      </td>
+                    </tr>
+                    {expandedJobId === job.id ? (
+                      <tr className="attempt-detail-row">
+                        <td colSpan={7}>
+                          <div className="attempt-history">
+                            <strong>任务 #{job.id} 的每次运行</strong>
+                            {attemptLoadingJobId === job.id ? (
+                              <span className="muted">正在加载…</span>
+                            ) : attempts.length === 0 ? (
+                              <span className="muted">暂无运行记录</span>
+                            ) : (
+                              <div className="attempt-table-wrap">
+                                <table className="attempt-table">
+                                  <thead>
+                                    <tr>
+                                      <th>次数 / 状态</th>
+                                      <th>开始 / 结束</th>
+                                      <th>断点</th>
+                                      <th>页数 / 计数</th>
+                                      <th>过滤</th>
+                                      <th>停止原因</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {attempts.map((attempt) => (
+                                      <tr key={attempt.id}>
+                                        <td>
+                                          <strong>第 {attempt.attempt_no} 次</strong>
+                                          <span>{formatCollectionStatus(attempt.status)}</span>
+                                        </td>
+                                        <td>
+                                          <span>{attempt.started_at}</span>
+                                          <span>{attempt.finished_at || "运行中"}</span>
+                                        </td>
+                                        <td>
+                                          <span>{attempt.start_max_mid || "0"}</span>
+                                          <span>→ {attempt.end_max_mid || attempt.start_max_mid || "0"}</span>
+                                        </td>
+                                        <td>
+                                          <span>{attempt.page_count} 页 · 看到 {attempt.total_seen_count}</span>
+                                          <span>新增 {attempt.inserted_count} · 重复 {attempt.duplicate_count}</span>
+                                        </td>
+                                        <td>
+                                          <span>红包 {attempt.filtered_red_packet_count}</span>
+                                          <span>系统通知 {attempt.filtered_system_notice_count}</span>
+                                        </td>
+                                        <td>
+                                          <strong>{attempt.stop_code || "—"}</strong>
+                                          <span>{attempt.stop_reason || "—"}</span>
+                                          {attempt.last_http_status ? (
+                                            <small>HTTP {attempt.last_http_status}</small>
+                                          ) : null}
+                                          {attempt.last_error_code ? (
+                                            <small>API {attempt.last_error_code}</small>
+                                          ) : null}
+                                        </td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    ) : null}
+                    </React.Fragment>
+                  );
+                })}
+              </tbody>
+            </table>
+            {!jobLoading && collectionJobs.length === 0 ? (
+              <div className="empty-state">没有符合条件的采集任务</div>
+            ) : null}
+          </div>
+          <div className="job-pagination">
+            <button
+              className="secondary-button compact-button"
+              type="button"
+              disabled={jobLoading || collectionJobOffset === 0}
+              onClick={() =>
+                void loadCollectionJobs(
+                  collectionJobStatusFilter,
+                  false,
+                  Math.max(0, collectionJobOffset - COLLECTION_JOB_PAGE_SIZE),
+                )
+              }
+            >
+              上一页
+            </button>
+            <span>
+              {collectionJobTotal === 0 ? 0 : collectionJobOffset + 1}–
+              {Math.min(collectionJobOffset + collectionJobs.length, collectionJobTotal)} / {collectionJobTotal}
+            </span>
+            <button
+              className="secondary-button compact-button"
+              type="button"
+              disabled={
+                jobLoading ||
+                collectionJobOffset + collectionJobs.length >= collectionJobTotal
+              }
+              onClick={() =>
+                void loadCollectionJobs(
+                  collectionJobStatusFilter,
+                  false,
+                  collectionJobOffset + COLLECTION_JOB_PAGE_SIZE,
+                )
+              }
+            >
+              下一页
+            </button>
+          </div>
+        </section>
+      ) : viewMode === "tools" ? (
+        <section className="advanced-tools-workspace">
+          <aside className="job-form-panel">
+            <div className="panel-title">
+              <h2>API 采集目标</h2>
+            </div>
+            <label>
+              <span>现有账号（留空可新增）</span>
+              <select
+                value={collectionJobForm.accountId}
+                onChange={(event) => {
+                  const accountId = event.target.value;
+                  const groupId = String(
+                    options.groups.find((group) => String(group.account_id) === accountId)?.id ?? "",
+                  );
+                  setCollectionJobForm((current) => ({ ...current, accountId, groupId }));
+                  setApiTargetForm(resolveApiTargetForm(options, accountId, groupId));
+                }}
+              >
+                <option value="">新增账号</option>
+                {options.accounts.map((account) => (
+                  <option key={account.id} value={account.id}>{account.display_name}</option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>现有群聊（留空可新增）</span>
+              <select
+                value={collectionJobForm.groupId}
+                onChange={(event) => {
+                  const groupId = event.target.value;
+                  setCollectionJobForm((current) => ({ ...current, groupId }));
+                  setApiTargetForm(resolveApiTargetForm(options, collectionJobForm.accountId, groupId));
+                }}
+              >
+                <option value="">新增群聊</option>
+                {visibleCollectionGroups.map((group) => (
+                  <option key={group.id} value={group.id}>{group.name}</option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>账号显示名称</span>
+              <input
+                value={apiTargetForm.accountName}
+                onChange={(event) => setApiTargetForm((current) => ({ ...current, accountName: event.target.value }))}
+                placeholder="例如：微博账号 A"
+              />
+            </label>
+            <label>
+              <span>群聊名称</span>
+              <input
+                value={apiTargetForm.groupName}
+                onChange={(event) => setApiTargetForm((current) => ({ ...current, groupName: event.target.value }))}
+                placeholder="微博中显示的群名"
+              />
+            </label>
+            <label>
+              <span>微博群 ID</span>
+              <input
+                inputMode="numeric"
+                value={apiTargetForm.sourceGroupId}
+                onChange={(event) => setApiTargetForm((current) => ({ ...current, sourceGroupId: event.target.value }))}
+                placeholder="query_messages 请求中的 id"
+              />
+            </label>
+            <button
+              className="secondary-button full-width-button"
+              type="button"
+              onClick={saveApiTarget}
+              disabled={jobLoading}
+            >
+              <Save size={16} aria-hidden="true" />
+              保存账号与群 ID
+            </button>
+          </aside>
+
+          <section className="job-form-panel">
+            <div className="panel-title">
+              <h2>JSON / CSV 数据导入</h2>
+            </div>
+            <label>
+              <span>账号</span>
+              <select
+                value={collectionJobForm.accountId}
+                onChange={(event) => {
+                  const accountId = event.target.value;
+                  const groupId = String(
+                    options.groups.find((group) => String(group.account_id) === accountId)?.id ?? "",
+                  );
+                  setCollectionJobForm((current) => ({ ...current, accountId, groupId }));
+                  setApiTargetForm(resolveApiTargetForm(options, accountId, groupId));
+                }}
+              >
+                <option value="">选择账号</option>
+                {options.accounts.map((account) => (
+                  <option key={account.id} value={account.id}>{account.display_name}</option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>群聊</span>
+              <select
+                value={collectionJobForm.groupId}
+                onChange={(event) => setCollectionJobForm((current) => ({ ...current, groupId: event.target.value }))}
+              >
+                <option value="">选择群聊</option>
+                {visibleCollectionGroups.map((group) => (
+                  <option key={group.id} value={group.id}>{group.name}</option>
+                ))}
+              </select>
+            </label>
+            <div className="tool-date-grid">
               <label>
-                <span>采集文件</span>
-                <select
-                  value={collectionJobForm.sourceFile}
+                <span>开始时间</span>
+                <input
+                  type="datetime-local"
+                  value={collectionJobForm.rangeStart}
                   onChange={(event) =>
                     setCollectionJobForm((current) => ({
                       ...current,
-                      sourceFile: event.target.value,
+                      rangeStart: event.target.value,
                     }))
                   }
-                >
-                  <option value="">选择 data/imports 中的文件</option>
-                  {importFiles.map((file) => (
-                    <option key={file.relative_path} value={file.relative_path}>
-                      {file.name} · {formatFileSize(file.size)} · {file.modified_at}
-                    </option>
-                  ))}
-                </select>
+                />
               </label>
-
-              <button
-                className="secondary-button full-width-button"
-                type="button"
-                onClick={runSingleGroupFileCollection}
-                disabled={jobLoading}
+              <label>
+                <span>结束时间</span>
+                <input
+                  type="datetime-local"
+                  value={collectionJobForm.rangeEnd}
+                  onChange={(event) =>
+                    setCollectionJobForm((current) => ({
+                      ...current,
+                      rangeEnd: event.target.value,
+                    }))
+                  }
+                />
+              </label>
+            </div>
+            <label>
+              <span>data/imports 中的文件</span>
+              <select
+                value={collectionJobForm.sourceFile}
+                onChange={(event) =>
+                  setCollectionJobForm((current) => ({
+                    ...current,
+                    sourceFile: event.target.value,
+                  }))
+                }
               >
-                <Database size={16} aria-hidden="true" />
-                执行文件采集
-              </button>
-
+                <option value="">选择 JSON 或 CSV 文件</option>
+                {importFiles.map((file) => (
+                  <option key={file.relative_path} value={file.relative_path}>
+                    {file.name} · {formatFileSize(file.size)} · {file.modified_at}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <button
+              className="icon-button full-width-button"
+              type="button"
+              onClick={runSingleGroupFileCollection}
+              disabled={jobLoading}
+            >
+              <Database size={16} aria-hidden="true" />
+              执行文件导入
+            </button>
+            <details className="legacy-tools">
+              <summary>调试工具</summary>
               <button
                 className="secondary-button full-width-button"
                 type="button"
@@ -1816,68 +2407,88 @@ function App() {
                 仅创建空任务
               </button>
             </details>
-          </aside>
+          </section>
 
-          <section className="job-list-panel">
+          <section className="job-list-panel capture-tools-panel">
             <div className="panel-title">
-              <h2>采集任务</h2>
-              <span>{jobLoading ? "加载中" : `${collectionJobs.length} / ${collectionJobTotal}`}</span>
+              <h2>网页快照导入</h2>
+              <span>{browserCaptures.length} 个快照</span>
             </div>
+            <div className="capture-tools-body">
+              <p className="form-hint no-side-margin">
+                使用上方数据导入区域所选的账号、群聊和时间范围生成脚本；
+                本地导入不会占用微博 API 队列。
+              </p>
+              <div className="tool-button-row">
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={generateBrowserCaptureSnippet}
+                  disabled={jobLoading}
+                >
+                  生成网页快照脚本
+                </button>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => void loadBrowserCaptures()}
+                  disabled={jobLoading}
+                >
+                  刷新快照
+                </button>
+              </div>
+              {browserCaptureSnippet ? (
+                <div className="capture-script">
+                  <textarea rows={6} readOnly value={browserCaptureSnippet} aria-label="网页快照脚本" />
+                  <button className="secondary-button" type="button" onClick={() => void copyBrowserCaptureSnippet()}>
+                    复制脚本
+                  </button>
+                </div>
+              ) : null}
 
-            <div className="job-toolbar">
-              <select
-                value={collectionJobStatusFilter}
-                onChange={(event) => {
-                  setCollectionJobStatusFilter(event.target.value);
-                  void loadCollectionJobs(event.target.value);
-                }}
-              >
-                <option value="">全部状态</option>
-                <option value="pending">pending</option>
-                <option value="running">running</option>
-                <option value="completed">completed</option>
-                <option value="failed">failed</option>
-                <option value="cancelled">cancelled</option>
-              </select>
-            </div>
+              <div className="capture-list">
+                {browserCaptures.map((capture) => (
+                  <article key={capture.id}>
+                    <strong>#{capture.id} · {capture.group_name}</strong>
+                    <span>{capture.account_name} · {capture.captured_at}</span>
+                    <span>{capture.range_start} 至 {capture.range_end} · {capture.text_length} 字符</span>
+                    <button
+                      className="secondary-button compact-button"
+                      type="button"
+                      onClick={() => void previewBrowserCapture(capture.id)}
+                      disabled={jobLoading}
+                    >
+                      解析预览
+                    </button>
+                  </article>
+                ))}
+                {!jobLoading && browserCaptures.length === 0 ? <p className="muted">还没有网页快照</p> : null}
+              </div>
 
-            <div className="job-list">
-              {collectionJobs.map((job) => (
-                <article className="job-card" key={job.id}>
-                  <div className="job-card-header">
-                    <strong>#{job.id} {job.group_name}</strong>
-                    <span className={`job-status status-${job.status}`}>{job.status}</span>
+              {browserCapturePreview ? (
+                <div className="capture-preview">
+                  <div className="capture-preview-header">
+                    <strong>快照 #{browserCapturePreview.capture_id} 解析预览</strong>
+                    <span>
+                      解析 {browserCapturePreview.parsed_count} · 重复{" "}
+                      {browserCapturePreview.duplicate_count} · 跳过{" "}
+                      {browserCapturePreview.skipped_blocks}
+                    </span>
                   </div>
-                  <dl>
-                    <div>
-                      <dt>账号</dt>
-                      <dd>{job.account_name}</dd>
-                    </div>
-                    <div>
-                      <dt>时间段</dt>
-                      <dd>{job.range_start} 至 {job.range_end}</dd>
-                    </div>
-                    <div>
-                      <dt>采集器</dt>
-                      <dd>{job.collector_type}</dd>
-                    </div>
-                    <div>
-                      <dt>结果</dt>
-                      <dd>
-                        新增 {job.inserted_count}，跳过 {job.skipped_count}，失败 {job.failed_count}
-                      </dd>
-                    </div>
-                    <div>
-                      <dt>创建</dt>
-                      <dd>{job.created_at}</dd>
-                    </div>
-                  </dl>
-                  {job.error_message ? <p className="job-error">{job.error_message}</p> : null}
-                </article>
-              ))}
-
-              {!jobLoading && collectionJobs.length === 0 ? (
-                <div className="empty-state">还没有采集任务</div>
+                  <div className="capture-preview-list">
+                    {browserCapturePreview.items.map((item) => (
+                      <article key={`${item.index}-${item.source_message_id}`}>
+                        <strong>{item.sender_name}</strong>
+                        <span>{item.sent_at} · {item.message_type}</span>
+                        <p>{item.content_text}</p>
+                        {item.is_duplicate ? <em>数据库中已存在</em> : null}
+                      </article>
+                    ))}
+                  </div>
+                  <button className="icon-button" type="button" onClick={importBrowserCapture} disabled={jobLoading}>
+                    导入该网页快照
+                  </button>
+                </div>
               ) : null}
             </div>
           </section>

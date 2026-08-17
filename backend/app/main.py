@@ -10,13 +10,19 @@ from .api.single_group_collection import router as single_group_collection_route
 from .api.weibo_api import router as weibo_api_router
 from .api.weibo_verifications import router as weibo_verifications_router
 from .database import initialize_database
+from .services.collection_worker import get_collection_worker
 from .settings import get_settings
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     initialize_database()
-    yield
+    worker = get_collection_worker()
+    worker.start()
+    try:
+        yield
+    finally:
+        worker.stop()
 
 
 app = FastAPI(title="Weibo Chat Collector", lifespan=lifespan)

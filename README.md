@@ -1,51 +1,73 @@
 # Weibo Chat Collector
 
-微博群聊消息的本地采集、归档、检索和管理工具。当前主线方案保留 collector 项目的多账号、群聊配置、SQLite 落库、搜索和删除能力，并使用微博 Web 端内部 JSON 接口代替网页 DOM 作为主要采集来源。
+微博群聊消息的本地采集、归档、检索和管理工具。当前主线保留 collector 的多账号、群聊配置、SQLite 落库和消息管理能力，以微博 Web 客户端的内部 JSON 接口作为主要采集来源。
 
 ## 当前架构
 
-`weibo-chat-collector` 是主项目，负责：
+`weibo-chat-collector` 是主项目，负责账号与群聊配置、采集队列、严格时间范围过滤、逐页落库、断点续传、监控、检索和删除。
 
-- 管理多个微博账号及其群聊。
-- 按用户指定的开始、结束时间采集消息。
-- 将所有账号、群聊的消息统一写入同一个 SQLite 数据库，同时保留账号和群聊维度。
-- 过滤红包消息，去重，并保存可识别的图片、链接、视频等附件记录。
-- 提供消息检索、筛选、详情、软删除、回收站和批量删除。
-- 保留 JSON/CSV 文件导入作为备用采集方式。
+相邻的 `weibo-chat-auto` 只提供两项初始化辅助：
 
-`weibo-chat-auto` 现在只作为初始化辅助工具：
+1. 每个账号扫码登录后生成 `cookies.json`。
+2. 打开目标群聊并从 `query_messages.json` 请求中发现群 `id`。
 
-1. 为每个微博账号扫码登录并生成 `cookies.json`。
-2. 在该账号打开目标群聊时，帮助找到 `query_messages.json` 请求中的 `id`，即微博群 ID。
-
-auto 的归档、查看器和 AI 分析流程不作为 collector 的数据主链路，也不会与 collector 共用数据库。
+auto 的归档、查看器和 AI 分析均不属于 collector 的采集链路，collector 运行时也不依赖 auto 的 AI 能力或数据库。
 
 ```text
-auto 扫码登录 -> cookies.json ----+
-                                  +-> collector 配置账号/群聊 -> 按时间段调用 API -> SQLite
-query_messages 请求 -> 群 ID -----+
+auto 扫码 -> cookies.json ---------------------+
+                                                |
+query_messages 请求 -> 群 id ------------------+-> collector 全局队列
+                                                    -> 逐页调用 API
+                                                    -> SQLite
 ```
 
-详细操作见 [docs/weibo-api-collection.md](docs/weibo-api-collection.md)。
+collector 调用的是观察自微博 Web 客户端的内部接口，不是公开、受支持或保证稳定的官方 API：
 
-## 安全约束
+```text
+https://api.weibo.com/webim/groupchat/query_messages.json
+```
+
+接口地址、字段、鉴权、分页和限流行为都可能随时改变。只能采集当前账号有权查看的数据，并应遵守微博服务条款和适用法律。
+
+## 任务执行模型
+
+`POST /api/collection-jobs/weibo-api` 只创建任务并返回 `202`，不会在当前 HTTP 请求里同步采集。所有账号共用一个后台串行队列：
+
+```text
+queued -> awaiting_confirmation -> running -> completed
+                                 \-> stopped
+```
+
+- 后台只把队首任务提升为 `awaiting_confirmation`；该任务等待人工确认期间也占用唯一活动位。
+- 用户关闭微博 App 和微博网页后，在“采集监控”中确认，任务才从 `awaiting_confirmation` 进入 `running`。
+- 每次 API 请求只处理一页。消息、过滤/去重计数、页记录和 `next_max_mid` 在同一个数据库事务中提交。
+- 已停止任务沿用原任务 ID 和已提交的 `next_max_mid` 重新排队；再次确认时新增一次 attempt，而不是新建任务或从头开始。
+- 所有错误都采用零重试：当前 attempt 立即停止，不自动恢复，失败请求或失败事务不会推进页记录、计数和断点。
+- 普通请求之间随机等待 3–8 秒；全局每累计 20 个请求后，到下一请求的间隔改为 30–60 秒，这次长等待替代普通等待，不与 3–8 秒叠加。
+- HTTP 429、微博业务码 10023 或 10024 会设置 60 分钟冷却。冷却结束后仍需人工点击续传，随后等待队列并再次确认，不会自动恢复。
+- 对排队中或待确认任务停止时，不会发出下一次请求；运行中“安全停止”会停在页边界。若请求已经发出，成功取得的该页会先完整提交再停止。
+- 达到单次运行页数上限时任务进入 `stopped`，保留断点供人工续传，不会把未覆盖完整的时间范围标成完成。
+
+当前高置信度过滤规则只过滤红包和粉丝群标识，两类消息都不写入 `messages`。普通问候等未命中高置信度规则的内容照常入库；`filtered_system_notice_count` 当前统计的是被过滤的粉丝群标识，不代表所有系统消息都会被删除。
+
+详细状态、操作和接口见 [采集任务说明](docs/collection-jobs.md) 与 [微博 API 采集指南](docs/weibo-api-collection.md)。
+
+## Cookie 与群 ID 安全
 
 - 每个账号的 Cookie 独立保存为 `data/auth/account-<id>.cookies.json`。
-- Cookie 内容不写入数据库；数据库只保存不敏感的登录配置文件名。
-- POSIX 系统把 Cookie 目录/文件权限强制设为 `0700`/`0600`，`data/auth/` 已加入 `.gitignore`；Windows 使用当前用户目录继承的 ACL，需确保其他本机用户无权读取项目目录。
-- 状态接口只返回文件是否存在、是否包含可发送到 API 域且未在客户端判定过期的非空 `SUB`、Cookie 数量和更新时间，不返回 Cookie 值；服务端登录态是否仍有效由实际 API 请求确认。
-- 不要把 `cookies.json`、Cookie、Token、Authorization 或账号密码提交到 Git、聊天记录、Issue 或日志。
-- 服务默认只监听 `127.0.0.1`；不要把带有 Cookie 导入能力的本地 API 暴露到公网。
+- Cookie 内容不写入数据库，也不由任何状态或采集 API 返回；数据库只保存不敏感的配置文件名。
+- POSIX 系统把 Cookie 目录/文件权限收紧为 `0700`/`0600`；Windows 继承当前项目目录 ACL，应确保其他本机用户无权读取。
+- `data/auth/` 不进入 Git。不要把 Cookie、Token、Authorization、账号密码或完整请求头提交到 Git、聊天、Issue、日志或截图。
+- 群 ID 存在 `chat_groups.source_group_id`，应从对应账号、对应群聊的 `query_messages.json?id=...` 中取得，不能只凭群名猜测。
+- 服务默认只监听 `127.0.0.1`；不要把带 Cookie 导入能力的本地 API 暴露到公网。
 
 ## 运行要求
 
 - Python `>= 3.10`，推荐 Python `3.12`。
-- Node.js `>= 18`，用于前端开发服务器。
-- 从本项目根目录执行下面的命令；数据库、附件、导入文件和鉴权目录均相对项目根解析，不依赖当前 shell 的其他目录。
+- Node.js `>= 18`。
+- 所有命令从本项目根目录执行。数据库、附件、导入和鉴权路径都相对项目根解析。
 
-### 后端：固定使用 8000 端口
-
-macOS / Linux：
+终端一启动后端，固定使用 8000 端口：
 
 ```bash
 python3.12 -m venv .venv
@@ -53,107 +75,77 @@ python3.12 -m venv .venv
 .venv/bin/python -m uvicorn app.main:app --reload --app-dir backend --host 127.0.0.1 --port 8000
 ```
 
-如果系统命令是 `python3`，可将第一行的 `python3.12` 替换为 `python3`，但应先确认版本不低于 3.10。Windows 所需的 IANA 时区数据已通过 `backend/requirements.txt` 的条件依赖安装。
+如果系统只有 `python3`，可替换第一行，但应先确认版本不低于 3.10。Windows 可使用 `py -3.12` 创建环境，并把后续解释器路径换成 `.\.venv\Scripts\python.exe`。
 
-Windows PowerShell：
-
-```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r .\backend\requirements.txt
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --app-dir .\backend --host 127.0.0.1 --port 8000
-```
-
-后端启动时会初始化所需数据库表。检查地址：
-
-- 健康检查：<http://127.0.0.1:8000/health>
-- API 文档：<http://127.0.0.1:8000/docs>
-
-### 前端：另一个终端
-
-仍从项目根目录执行：
+终端二仍从项目根目录启动前端：
 
 ```bash
 npm --prefix frontend install
 npm --prefix frontend run dev
 ```
 
-打开 <http://127.0.0.1:5173>。Vite 开发服务器会把 `/api` 和 `/health` 统一代理到 `http://127.0.0.1:8000`，因此无需修改前端 API 地址。
+打开 <http://127.0.0.1:5173>。Vite 将 `/api` 和 `/health` 代理到 `http://127.0.0.1:8000`。
 
-## 首次配置与采集
+- 健康检查：<http://127.0.0.1:8000/health>
+- API 文档：<http://127.0.0.1:8000/docs>
 
-对每个微博账号分别执行以下流程：
+## UI 使用流程
 
-1. 在相邻的 `weibo-chat-auto` 项目中扫码登录，取得该账号的 `cookies.json`。
-2. 打开目标群聊，从 `query_messages.json` 网络请求的查询参数 `id` 取得群 ID。
-3. 在 collector 的“采集任务”页填写账号显示名称、群聊名称和微博群 ID，点击“保存账号与群 ID”。
-4. 确认当前选择的是对应账号，然后导入该账号的 `cookies.json`。
-5. 选择开始时间和结束时间，点击“开始 API 采集”。
-6. 在采集任务列表确认结果，再到消息页检索入库记录。
+首次配置：
 
-第二个账号必须重新扫码并把新生成的 `cookies.json` 导入到第二个 collector 账号，不能复用第一个账号的 Cookie 文件。
+1. 在 auto 中为账号扫码，取得该账号的 `cookies.json`。
+2. 用同一账号打开目标群聊，记录 `query_messages.json` 查询参数中的 `id`。
+3. 在 collector 的“高级工具 / 数据导入”中创建或更新账号、群聊和群 ID 绑定。
 
-## API 采集行为
+开始采集：
 
-主入口是：
+1. 在“采集任务”中选择已配置的账号和群聊。
+2. 为当前账号导入对应的 `cookies.json`，确认 Cookie 和群 ID 都已就绪。
+3. 选择开始、结束时间并创建任务。任务先进入 `queued`。
+4. 在“采集监控”查看队列位置、状态、attempt 次数、页数、当前最早消息时间、`next_max_mid`、计数和停止原因。
+5. 任务进入 `awaiting_confirmation` 后，关闭微博 App 和所有微博网页，再点击“确认并启动”。
+6. 已停止任务按提示处理后点击“沿断点续传”；风险冷却任务需先等待 60 分钟。
 
-```text
-POST /api/collection-jobs/weibo-api
-```
+第二个账号必须重新扫码并导入自己的 Cookie，不能复用第一个账号的文件。
 
-请求体示例：
+## 高级工具与备用导入
 
-```json
-{
-  "account_id": 1,
-  "group_id": 1,
-  "range_start": "2026-08-01 00:00:00",
-  "range_end": "2026-08-01 23:59:59"
-}
-```
+“高级工具 / 数据导入”集中放置：
 
-- `range_start` 必须早于 `range_end`。
-- 服务从新消息向旧消息分页，覆盖开始边界后停止，只入库 `range_start <= sent_at <= range_end` 的消息。
-- 如果页数上限耗尽但仍未覆盖开始边界，任务会失败，不会把不完整结果伪装成成功。
-- 超时、HTTP `429` 和 `5xx` 使用有上限的退避重试；默认额外重试 2 次，即最多尝试 3 次。
-- 登录失效、群不可访问、限流、响应异常、分页异常和网络失败都会明确返回错误。已经创建的任务会标记为 `failed` 并记录错误信息，不静默跳过。
-- 同一账号同一时间只允许一个 API 采集任务运行。
+- API 采集目标配置。
+- `data/imports/` 下的 JSON/CSV 文件导入。
+- 网页快照生成、预览和显式导入。
 
-可通过项目根目录的 `.env` 调整页大小、最大页数、页间延迟、超时和重试参数，示例见 [.env.example](.env.example)。
+JSON/CSV 和网页快照不占微博 API 队列。文件导入继续保留；网页跨域快照受 CORS、Private Network Access 和页面安全策略影响，已不再是推荐主流程。
 
-## 备用采集方式
+当前交付以桌面端为目标。前端虽然有基础响应式样式，但移动端任务监控、宽表操作和完整交互验证延后处理。
 
-- JSON/CSV 文件导入继续保留，可在“采集任务”页的“备用：文件导入”中使用，也可运行 `scripts/import_messages.py`。
-- 网页快照相关历史代码和数据继续保留用于研究；当前后端 CORS 只允许本地前端来源，加上浏览器 Private Network Access 和页面安全策略已收紧，从微博页面跨域回传本机快照不再作为推荐主流程。
+## 验证边界
 
-## 重要限制
+本地自动化测试使用临时 SQLite 和模拟响应验证核心实现，但不代表已经完成真实微博网络端到端验证。当前不能声称：
 
-collector 当前调用的是从微博 Web 客户端行为中观察到的内部接口：
-
-```text
-https://api.weibo.com/webim/groupchat/query_messages.json
-```
-
-它不是公开、受支持或保证稳定的官方 API，字段、鉴权、分页方式和可用性都可能在没有通知的情况下改变。使用时应遵守微博服务条款、账号权限和适用法律，控制请求频率，并仅采集有权访问的数据。
-
-当前实现已有本地自动化测试，但尚未声称已用真实微博账号完成端到端 API 验证。尤其是图片、文件、链接、视频等附件字段仍需用真实且脱敏的响应确认；现阶段主要保存从已知字段映射出的附件 URL/元数据，不代表附件原件已成功下载。
+- 内部 API 已在真实微博账号上稳定可用。
+- 所有账号、群聊和消息类型都符合当前字段映射。
+- 图片、文件、链接、视频等附件字段已经实机确认。
+- 附件原件已经成功下载；当前主要记录可识别的 URL 和元数据。
 
 ## 文档
 
-- [docs/weibo-api-collection.md](docs/weibo-api-collection.md)：API 采集架构、安全约束和完整操作流程。
-- [docs/current-status.md](docs/current-status.md)：当前完成度、验证边界和下一步。
-- [docs/import-format.md](docs/import-format.md)：JSON/CSV 手动导入格式。
-- [docs/message-api.md](docs/message-api.md)：消息列表、详情和筛选接口。
-- [docs/collection-jobs.md](docs/collection-jobs.md)：通用采集任务框架。
-- [docs/single-group-collection.md](docs/single-group-collection.md)：备用的单群聊文件采集。
-- [docs/browser-capture.md](docs/browser-capture.md)：非主流程的网页快照说明。
-- [docs/recycle-bin.md](docs/recycle-bin.md)：回收站、恢复和彻底删除。
+- [微博 API 采集指南](docs/weibo-api-collection.md)
+- [采集任务与监控](docs/collection-jobs.md)
+- [当前状态与下一步](docs/current-status.md)
+- [数据模型](docs/data-model.md)
+- [运行与调试](docs/run-and-debug.md)
+- [JSON/CSV 导入格式](docs/import-format.md)
+- [消息接口](docs/message-api.md)
+- [回收站](docs/recycle-bin.md)
 
 ## 项目结构
 
 ```text
 weibo-chat-collector/
-  backend/              # FastAPI 后端和采集器
-  frontend/             # React + Vite 前端
+  backend/              # FastAPI、后台采集 worker 和入库服务
+  frontend/             # React + Vite
   data/
     auth/               # 按账号隔离的 Cookie，仅本机保存且不进 Git
     attachments/        # 附件原件目录

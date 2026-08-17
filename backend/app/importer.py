@@ -3,21 +3,13 @@ import hashlib
 import json
 import shutil
 import sqlite3
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-
-RED_PACKET_TYPES = {"red_packet", "hongbao", "weibo_red_packet"}
-RED_PACKET_TEXTS = {
-    "红包",
-    "[红包]",
-    "微博红包",
-    "[微博红包]",
-    "发了一个红包",
-    "领取了红包",
-}
+from .services.message_filter import MessageFilterKind, classify_message_filter
 
 
 @dataclass
@@ -29,6 +21,7 @@ class ImportSummary:
     inserted_count: int = 0
     skipped_count: int = 0
     red_packet_count: int = 0
+    filtered_system_notice_count: int = 0
     duplicate_count: int = 0
     attachment_count: int = 0
 
@@ -71,8 +64,13 @@ def import_file(
         )
 
         for raw_message in messages:
-            if is_red_packet(raw_message):
+            filter_kind = classify_import_filter(raw_message)
+            if filter_kind == "red_packet":
                 summary.red_packet_count += 1
+                summary.skipped_count += 1
+                continue
+            if filter_kind == "fansgroup_badge":
+                summary.filtered_system_notice_count += 1
                 summary.skipped_count += 1
                 continue
 
@@ -377,27 +375,42 @@ def finish_collection_job(
             total_seen_count = ?,
             inserted_count = ?,
             skipped_count = ?,
-            failed_count = 0
+            failed_count = 0,
+            filtered_red_packet_count = ?,
+            filtered_system_notice_count = ?
         WHERE id = ?
         """,
         (
             summary.total_count,
             summary.inserted_count,
             summary.skipped_count,
+            summary.red_packet_count,
+            summary.filtered_system_notice_count,
             collection_job_id,
         ),
     )
 
 
 def is_red_packet(message: dict[str, Any]) -> bool:
-    message_type = str(message.get("message_type") or "").strip().lower()
-    if message_type in RED_PACKET_TYPES:
-        return True
+    """Compatibility wrapper around the shared high-confidence classifier."""
 
-    text = normalize_text(message.get("content_text") or "")
-    if text in RED_PACKET_TEXTS:
-        return True
-    return False
+    return classify_import_filter(message) == "red_packet"
+
+
+def classify_import_filter(message: Mapping[str, Any]) -> MessageFilterKind | None:
+    """Classify normalized imports together with any embedded raw payload."""
+
+    raw_payload = message.get("raw_payload")
+    if isinstance(raw_payload, str):
+        try:
+            decoded = json.loads(raw_payload)
+        except (json.JSONDecodeError, TypeError):
+            decoded = None
+        raw_payload = decoded if isinstance(decoded, Mapping) else None
+
+    combined = dict(raw_payload) if isinstance(raw_payload, Mapping) else {}
+    combined.update(message)
+    return classify_message_filter(combined)
 
 
 def normalize_text(value: str) -> str:

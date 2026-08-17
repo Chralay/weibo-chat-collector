@@ -24,6 +24,7 @@ from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 from zoneinfo import ZoneInfo
 
+from ..services.message_filter import classify_message_filter
 from .base import AttachmentCandidate, CollectionCandidate
 
 
@@ -288,13 +289,23 @@ class WeiboApiError(RuntimeError):
 class WeiboAuthenticationError(WeiboApiError):
     """The account cookie is absent or expired (Weibo error 21301)."""
 
+    def __init__(self, message: str, *, http_status: int | None = None):
+        self.http_status = http_status
+        super().__init__(message)
+
 
 class WeiboGroupError(WeiboApiError):
     """The group is missing or inaccessible (Weibo error 21201)."""
 
+    def __init__(self, message: str, *, http_status: int | None = None):
+        self.http_status = http_status
+        super().__init__(message)
+
 
 class WeiboRateLimitError(WeiboApiError):
-    """HTTP 429 remained after bounded retries."""
+    """The endpoint rejected the single request with HTTP 429."""
+
+    status = 429
 
 
 class WeiboHttpError(WeiboApiError):
@@ -306,7 +317,7 @@ class WeiboHttpError(WeiboApiError):
 
 
 class WeiboTimeoutError(WeiboApiError):
-    """All bounded attempts timed out."""
+    """The single request timed out."""
 
 
 class WeiboTransportError(WeiboApiError):
@@ -316,8 +327,15 @@ class WeiboTransportError(WeiboApiError):
 class WeiboResponseError(WeiboApiError):
     """The HTTP response is invalid or contains an unhandled business error."""
 
-    def __init__(self, message: str, *, error_code: int | str | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: int | str | None = None,
+        http_status: int | None = None,
+    ):
         self.error_code = error_code
+        self.http_status = http_status
         super().__init__(message)
 
 
@@ -367,26 +385,14 @@ class WeiboApiClient:
         cookie_store: CookieProfileStore,
         *,
         transport: Transport | None = None,
-        sleep: Callable[[float], None] | None = None,
         timeout: float = 30.0,
-        max_attempts: int = 3,
-        backoff_base: float = 0.5,
-        backoff_cap: float = 30.0,
         clock: Callable[[], float] | None = None,
     ):
         if timeout <= 0:
             raise ValueError("timeout must be positive")
-        if max_attempts < 1:
-            raise ValueError("max_attempts must be at least 1")
-        if backoff_base < 0 or backoff_cap < 0:
-            raise ValueError("backoff values cannot be negative")
         self.cookie_store = cookie_store
         self.transport = transport or _urllib_transport
-        self.sleep = sleep or time.sleep
         self.timeout = float(timeout)
-        self.max_attempts = max_attempts
-        self.backoff_base = float(backoff_base)
-        self.backoff_cap = float(backoff_cap)
         self.clock = clock or time.time
 
     def query_messages(
@@ -422,80 +428,63 @@ class WeiboApiClient:
             method="GET",
         )
 
-        for attempt in range(self.max_attempts):
+        try:
+            response = self.transport(request, self.timeout)
+        except (TimeoutError, socket.timeout) as error:
+            raise WeiboTimeoutError("Weibo API request timed out") from error
+        except URLError as error:
+            if isinstance(error.reason, (TimeoutError, socket.timeout)):
+                raise WeiboTimeoutError("Weibo API request timed out") from error
+            raise WeiboTransportError("Weibo API transport failed") from error
+
+        status = int(response.status)
+        if not 200 <= status <= 299:
+            # Weibo commonly uses HTTP 200 for business errors, but retain
+            # useful classifications when a gateway keeps the JSON body.
             try:
-                response = self.transport(request, self.timeout)
-            except (TimeoutError, socket.timeout) as error:
-                if attempt + 1 >= self.max_attempts:
-                    raise WeiboTimeoutError(
-                        f"Weibo API timed out after {self.max_attempts} attempts"
-                    ) from error
-                self.sleep(self._backoff(attempt))
-                continue
-            except URLError as error:
-                if isinstance(error.reason, (TimeoutError, socket.timeout)):
-                    if attempt + 1 >= self.max_attempts:
-                        raise WeiboTimeoutError(
-                            f"Weibo API timed out after {self.max_attempts} attempts"
-                        ) from error
-                    self.sleep(self._backoff(attempt))
-                    continue
-                raise WeiboTransportError("Weibo API transport failed") from error
-
-            status = int(response.status)
-            if status == 429:
-                if attempt + 1 >= self.max_attempts:
-                    raise WeiboRateLimitError(
-                        f"Weibo API rate limited after {self.max_attempts} attempts"
-                    )
-                self.sleep(self._retry_delay(response.headers, attempt))
-                continue
-            if 500 <= status <= 599:
-                if attempt + 1 >= self.max_attempts:
-                    raise WeiboHttpError(status)
-                self.sleep(self._retry_delay(response.headers, attempt))
-                continue
-            if not 200 <= status <= 299:
-                # Weibo commonly uses HTTP 200 for business errors, but retain
-                # the useful auth/group classification if a gateway preserves
-                # the JSON body while changing the HTTP status.
-                try:
-                    error_payload = self._decode_json(response.body)
-                except WeiboResponseError:
-                    error_payload = {}
-                normalized_code = self._normalize_error_code(error_payload.get("error_code"))
-                if normalized_code == 21301:
-                    raise WeiboAuthenticationError(
-                        "Weibo account authentication is invalid (21301)"
-                    )
-                if normalized_code == 21201:
-                    raise WeiboGroupError(
-                        "Weibo group is missing or inaccessible (21201)"
-                    )
-                raise WeiboHttpError(status)
-
-            payload = self._decode_json(response.body)
-            error_code = payload.get("error_code")
-            normalized_code = self._normalize_error_code(error_code)
+                error_payload = self._decode_json(response.body)
+            except WeiboResponseError:
+                error_payload = {}
+            normalized_code = self._normalize_error_code(error_payload.get("error_code"))
             if normalized_code == 21301:
-                raise WeiboAuthenticationError("Weibo account authentication is invalid (21301)")
+                raise WeiboAuthenticationError(
+                    "Weibo account authentication is invalid (21301)",
+                    http_status=status,
+                )
             if normalized_code == 21201:
-                raise WeiboGroupError("Weibo group is missing or inaccessible (21201)")
+                raise WeiboGroupError(
+                    "Weibo group is missing or inaccessible (21201)",
+                    http_status=status,
+                )
             if normalized_code not in (None, 0):
                 raise WeiboResponseError(
-                    f"Weibo API business error {normalized_code}", error_code=normalized_code
+                    f"Weibo API business error {normalized_code}",
+                    error_code=normalized_code,
+                    http_status=status,
                 )
-            if payload.get("ok") in (False, 0, "0") or payload.get("error") not in (
-                None,
-                "",
-                False,
-            ):
-                raise WeiboResponseError(
-                    "Weibo API indicated failure without a recognized error code"
-                )
-            return payload
+            if status == 429:
+                raise WeiboRateLimitError("Weibo API rate limited the request (HTTP 429)")
+            raise WeiboHttpError(status)
 
-        raise AssertionError("bounded retry loop exited unexpectedly")
+        payload = self._decode_json(response.body)
+        normalized_code = self._normalize_error_code(payload.get("error_code"))
+        if normalized_code == 21301:
+            raise WeiboAuthenticationError("Weibo account authentication is invalid (21301)")
+        if normalized_code == 21201:
+            raise WeiboGroupError("Weibo group is missing or inaccessible (21201)")
+        if normalized_code not in (None, 0):
+            raise WeiboResponseError(
+                f"Weibo API business error {normalized_code}", error_code=normalized_code
+            )
+        if payload.get("ok") in (False, 0, "0") or payload.get("error") not in (
+            None,
+            "",
+            False,
+        ):
+            raise WeiboResponseError(
+                "Weibo API indicated failure without a recognized error code"
+            )
+        return payload
 
     # Naming alias for consumers that think in pages rather than endpoints.
     fetch_messages = query_messages
@@ -519,33 +508,6 @@ class WeiboApiClient:
             return int(value)
         except (TypeError, ValueError):
             return str(value)
-
-    def _backoff(self, attempt: int) -> float:
-        return min(self.backoff_cap, self.backoff_base * (2**attempt))
-
-    def _retry_delay(self, headers: Mapping[str, str], attempt: int) -> float:
-        retry_after = next(
-            (value for key, value in headers.items() if key.lower() == "retry-after"), None
-        )
-        if retry_after is not None:
-            parsed = self._parse_retry_after(str(retry_after))
-            if parsed is not None:
-                return min(self.backoff_cap, parsed)
-        return self._backoff(attempt)
-
-    def _parse_retry_after(self, value: str) -> float | None:
-        try:
-            return max(0.0, float(value.strip()))
-        except ValueError:
-            pass
-        try:
-            when = parsedate_to_datetime(value)
-            if when.tzinfo is None:
-                when = when.replace(tzinfo=timezone.utc)
-            return max(0.0, when.timestamp() - self.clock())
-        except (TypeError, ValueError, OverflowError):
-            return None
-
 
 def _target_zone(timezone_name: str | ZoneInfo) -> ZoneInfo:
     return timezone_name if isinstance(timezone_name, ZoneInfo) else ZoneInfo(timezone_name)
@@ -637,45 +599,11 @@ def _nested_url(value: Any) -> str | None:
     return None
 
 
-_RED_PACKET_TYPES = {
-    "red_packet",
-    "hongbao",
-    "weibo_red_packet",
-    "红包",
-    "weibo_hongbao",
-}
-_RED_PACKET_EXACT_TEXTS = {
-    "红包",
-    "[红包]",
-    "微博红包",
-    "[微博红包]",
-    "发了一个红包",
-    "领取了红包",
-    "收到红包消息",
-}
-
-
 def is_weibo_red_packet(raw: Mapping[str, Any], content_text: str | None = None) -> bool:
-    if raw.get("is_red_packet") is True:
-        return True
-    normalized_types: set[str] = set()
-    for field in ("type", "msg_type", "message_type"):
-        message_type = str(raw.get(field) or "").strip().lower()
-        if message_type:
-            normalized_types.add(message_type)
-        if message_type in _RED_PACKET_TYPES or "hongbao" in message_type:
-            return True
-    text = _clean_text(content_text if content_text is not None else _first_present(
-        raw, ("content", "text", "message", "body")
-    ))
-    if text in _RED_PACKET_EXACT_TEXTS:
-        return True
-    is_system_like = raw.get("is_system_message") is True or bool(
-        normalized_types & {"system", "notice", "system_message"}
-    )
-    return is_system_like and (
-        "收到红包消息" in text or ("领取了" in text and "红包" in text)
-    )
+    candidate = dict(raw)
+    if content_text is not None:
+        candidate["content"] = content_text
+    return classify_message_filter(candidate) == "red_packet"
 
 
 def _map_attachments(raw: Mapping[str, Any]) -> list[AttachmentCandidate]:
@@ -865,6 +793,20 @@ def _id_sort_key(value: str | None) -> tuple[int, int | str]:
     return (1, "")
 
 
+@dataclass(frozen=True, slots=True)
+class WeiboCollectionPage:
+    """One validated API page and the cursor that may be committed with it."""
+
+    request_max_mid: str
+    next_max_mid: str
+    candidates: tuple[CollectionCandidate, ...]
+    raw_count: int
+    newest_sent_at: datetime | None
+    oldest_sent_at: datetime | None
+    reached_range_start: bool
+    terminal: bool
+
+
 class WeiboApiCollector:
     """Page from newest history toward the requested start, then filter exactly."""
 
@@ -900,6 +842,79 @@ class WeiboApiCollector:
         self.raw_message_count = 0
         self.total_seen_count = 0
 
+    def fetch_page(
+        self,
+        account_id: int,
+        group_id: int,
+        *,
+        max_mid: str | int,
+        range_start: datetime,
+        previous_oldest_at: datetime | None = None,
+    ) -> WeiboCollectionPage:
+        """Fetch and validate exactly one page without sleeping or persisting it."""
+
+        start = _coerce_range(range_start, self.zone, "range_start")
+        request_cursor = str(max_mid)
+        payload = self.client.query_messages(
+            account_id,
+            self.source_group_id,
+            max_mid=request_cursor,
+            count=self.page_size,
+        )
+        raw_messages = _extract_messages(payload)
+        self.page_count += 1
+        self.raw_message_count += len(raw_messages)
+        if not raw_messages:
+            return WeiboCollectionPage(
+                request_max_mid=request_cursor,
+                next_max_mid=request_cursor,
+                candidates=(),
+                raw_count=0,
+                newest_sent_at=None,
+                oldest_sent_at=None,
+                reached_range_start=True,
+                terminal=True,
+            )
+
+        candidates = tuple(
+            map_weibo_message(raw, account_id, group_id, self.zone)
+            for raw in raw_messages
+        )
+        self._validate_page_order(candidates)
+        oldest = min(
+            candidates,
+            key=lambda item: (item.sent_at, _id_sort_key(item.source_message_id)),
+        )
+        newest = max(
+            candidates,
+            key=lambda item: (item.sent_at, _id_sort_key(item.source_message_id)),
+        )
+        next_cursor = oldest.source_message_id
+        if next_cursor is None:
+            raise WeiboResponseError("oldest Weibo message has no cursor ID")
+        if next_cursor == request_cursor:
+            raise WeiboIncompleteCollectionError(
+                "Weibo pagination repeated the current cursor"
+            )
+        if previous_oldest_at is not None:
+            previous = _coerce_range(previous_oldest_at, self.zone, "previous_oldest_at")
+            if oldest.sent_at > previous:
+                raise WeiboResponseError(
+                    "Weibo pagination moved forward instead of toward older messages"
+                )
+
+        return WeiboCollectionPage(
+            request_max_mid=request_cursor,
+            next_max_mid=next_cursor,
+            candidates=candidates,
+            raw_count=len(raw_messages),
+            newest_sent_at=newest.sent_at,
+            oldest_sent_at=oldest.sent_at,
+            # Equality deliberately continues for same-second boundary messages.
+            reached_range_start=oldest.sent_at < start,
+            terminal=False,
+        )
+
     def collect(
         self,
         account_id: int,
@@ -927,42 +942,18 @@ class WeiboApiCollector:
         terminal_page = False
 
         for page_index in range(self.max_pages):
-            payload = self.client.query_messages(
+            page = self.fetch_page(
                 account_id,
-                self.source_group_id,
+                group_id,
                 max_mid=max_mid,
-                count=self.page_size,
+                range_start=start,
+                previous_oldest_at=previous_oldest,
             )
-            self.page_count += 1
-            raw_messages = _extract_messages(payload)
-            self.raw_message_count += len(raw_messages)
-            if not raw_messages:
+            if page.terminal:
                 terminal_page = True
                 break
 
-            page = [
-                map_weibo_message(raw, account_id, group_id, self.zone)
-                for raw in raw_messages
-            ]
-            self._validate_page_order(page)
-
-            oldest = min(page, key=lambda item: (item.sent_at, _id_sort_key(item.source_message_id)))
-            page_oldest = oldest.sent_at
-            cursor = oldest.source_message_id
-            if cursor is None:
-                raise WeiboResponseError("oldest Weibo message has no cursor ID")
-
-            if previous_oldest is not None:
-                for candidate in page:
-                    if (
-                        candidate.source_message_id not in seen_message_ids
-                        and candidate.sent_at > previous_oldest
-                    ):
-                        raise WeiboResponseError(
-                            "Weibo pagination moved forward instead of toward older messages"
-                        )
-
-            for candidate in page:
+            for candidate in page.candidates:
                 message_id = candidate.source_message_id
                 if message_id is None or message_id in seen_message_ids:
                     continue
@@ -973,17 +964,17 @@ class WeiboApiCollector:
 
             # Continue beyond equality: a following page can contain additional
             # messages with the exact same second as range_start.
-            if page_oldest < start:
+            if page.reached_range_start:
                 covered_start = True
                 break
 
-            if cursor == max_mid or cursor in seen_cursors:
+            if page.next_max_mid in seen_cursors:
                 raise WeiboIncompleteCollectionError(
                     "Weibo pagination repeated a cursor before range_start was covered"
                 )
-            seen_cursors.add(cursor)
-            max_mid = cursor
-            previous_oldest = page_oldest
+            seen_cursors.add(page.next_max_mid)
+            max_mid = page.next_max_mid
+            previous_oldest = page.oldest_sent_at
 
             if page_index + 1 < self.max_pages and self.inter_page_delay:
                 self.sleep(self.inter_page_delay)
@@ -1017,6 +1008,7 @@ __all__ = [
     "WEIBO_SOURCE",
     "WeiboApiClient",
     "WeiboApiCollector",
+    "WeiboCollectionPage",
     "WeiboApiError",
     "WeiboAuthenticationError",
     "WeiboGroupError",

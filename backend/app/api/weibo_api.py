@@ -1,38 +1,25 @@
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 import sqlite3
-import threading
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 from ..collectors.weibo_api import (
     CookieProfileError,
     CookieProfileStore,
-    WeiboApiClient,
-    WeiboApiCollector,
     WeiboApiError,
-    WeiboAuthenticationError,
-    WeiboGroupError,
-    WeiboRateLimitError,
 )
 from ..database import connection_context, get_connection
-from ..services.collection_runner import (
-    create_running_api_job,
-    ingest_api_candidates,
-    mark_api_job_failed,
-)
+from ..services.collection_runner import create_queued_api_job
+from ..services.collection_worker import get_collection_worker
 from ..settings import get_settings
 from .collection_jobs import get_collection_job, parse_datetime
 
 
 router = APIRouter(prefix="/api", tags=["weibo-api"])
-
-_account_locks: dict[int, threading.Lock] = {}
-_account_locks_guard = threading.Lock()
 
 
 class UpsertApiTargetRequest(BaseModel):
@@ -67,11 +54,6 @@ class RunWeiboApiCollectionRequest(BaseModel):
     group_id: int
     range_start: str
     range_end: str
-
-
-def get_account_lock(account_id: int) -> threading.Lock:
-    with _account_locks_guard:
-        return _account_locks.setdefault(account_id, threading.Lock())
 
 
 def status_to_dict(status: Any) -> dict[str, Any]:
@@ -326,20 +308,11 @@ def save_account_cookies(
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
 
-    account_lock = get_account_lock(account_id)
-    if not account_lock.acquire(blocking=False):
-        raise HTTPException(
-            status_code=409,
-            detail="This account already has a running API collection.",
-        )
     store = CookieProfileStore(get_settings().weibo_api_auth_dir)
     try:
-        try:
-            status = store.save(account_id, request.cookies)
-        except (ValueError, CookieProfileError) as error:
-            raise HTTPException(status_code=400, detail=str(error)) from error
-    finally:
-        account_lock.release()
+        status = store.save(account_id, request.cookies)
+    except (ValueError, CookieProfileError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
     profile_name = f"account-{account_id}.cookies.json"
     connection.execute(
@@ -385,8 +358,8 @@ def get_api_status(
     return {"accounts": accounts, "groups": groups}
 
 
-@router.post("/collection-jobs/weibo-api")
-def run_weibo_api_collection(request: RunWeiboApiCollectionRequest):
+@router.post("/collection-jobs/weibo-api", status_code=202)
+def create_weibo_api_collection(request: RunWeiboApiCollectionRequest):
     settings = get_settings()
     try:
         configured_zone = ZoneInfo(settings.weibo_api_timezone)
@@ -412,98 +385,58 @@ def run_weibo_api_collection(request: RunWeiboApiCollectionRequest):
         raise HTTPException(status_code=400, detail="range_start must be before range_end.")
 
     with connection_context() as connection:
-        account, group = load_target(connection, request.account_id, request.group_id)
-        account_name = str(account["display_name"])
-        group_name = str(group["name"])
-        source_group_id = str(group["source_group_id"])
-
-    account_lock = get_account_lock(request.account_id)
-    if not account_lock.acquire(blocking=False):
-        raise HTTPException(
-            status_code=409,
-            detail="This account already has a running API collection.",
-        )
+        load_target(connection, request.account_id, request.group_id)
 
     store = CookieProfileStore(settings.weibo_api_auth_dir)
     try:
         store.cookie_header(request.account_id)
     except (ValueError, CookieProfileError) as error:
-        account_lock.release()
         raise HTTPException(status_code=400, detail=str(error)) from error
 
-    job_id: int | None = None
-    try:
-        with connection_context() as connection:
-            job_id = create_running_api_job(
-                connection,
-                account_id=request.account_id,
-                group_id=request.group_id,
-                range_start=range_start,
-                range_end=range_end,
+    with connection_context() as connection:
+        # Serialize duplicate detection with insertion.  Without the write
+        # transaction, concurrent POSTs could both observe no unfinished job.
+        connection.execute("BEGIN IMMEDIATE")
+        _account, group = load_target(connection, request.account_id, request.group_id)
+        source_group_id = str(group["source_group_id"])
+        range_start_text = range_start.strftime("%Y-%m-%d %H:%M:%S")
+        range_end_text = range_end.strftime("%Y-%m-%d %H:%M:%S")
+        existing = connection.execute(
+            """
+            SELECT id, status
+            FROM collection_jobs
+            WHERE collector_type = 'weibo_api_v2'
+              AND account_id = ? AND group_id = ?
+              AND range_start = ? AND range_end = ?
+              AND status IN ('queued', 'awaiting_confirmation', 'running', 'stopped')
+            ORDER BY id DESC LIMIT 1
+            """,
+            (
+                request.account_id,
+                request.group_id,
+                range_start_text,
+                range_end_text,
+            ),
+        ).fetchone()
+        if existing is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "An unfinished task already exists for this target and range: "
+                    f"#{int(existing['id'])} ({str(existing['status'])})."
+                ),
             )
-
-        client = WeiboApiClient(
-            store,
-            timeout=settings.weibo_api_request_timeout_seconds,
-            max_attempts=settings.weibo_api_max_retries + 1,
-            backoff_base=settings.weibo_api_retry_base_seconds,
-        )
-        collector = WeiboApiCollector(
-            client,
-            source_group_id,
-            page_size=settings.weibo_api_page_size,
-            max_pages=settings.weibo_api_max_pages,
+        job_id = create_queued_api_job(
+            connection,
+            account_id=request.account_id,
+            group_id=request.group_id,
+            source_group_id=source_group_id,
+            range_start=range_start,
+            range_end=range_end,
             timezone_name=settings.weibo_api_timezone,
-            inter_page_delay=settings.weibo_api_page_delay_seconds,
+            page_size=settings.weibo_api_page_size,
         )
-        candidates = collector.collect(
-            request.account_id,
-            request.group_id,
-            range_start,
-            range_end,
-        )
+        job = get_collection_job(job_id, connection)
 
-        with connection_context() as connection:
-            summary = ingest_api_candidates(
-                connection,
-                collection_job_id=job_id,
-                account_id=request.account_id,
-                group_id=request.group_id,
-                candidates=candidates,
-                source_total_count=getattr(collector, "total_seen_count", len(candidates)),
-                page_count=getattr(collector, "page_count", 0),
-            )
-            job = get_collection_job(job_id, connection)
-
-        return {
-            "account": account_name,
-            "group": group_name,
-            "summary": summary.to_dict(),
-            "job": job,
-        }
-    except Exception as error:
-        error_detail = public_collection_error(error)
-        if job_id is not None:
-            with connection_context() as connection:
-                mark_api_job_failed(connection, job_id, error_detail)
-                job = get_collection_job(job_id, connection)
-        else:
-            job = None
-
-        status_code = 502
-        if isinstance(error, WeiboAuthenticationError):
-            status_code = 401
-        elif isinstance(error, WeiboGroupError):
-            status_code = 404
-        elif isinstance(error, WeiboRateLimitError):
-            status_code = 429
-        elif isinstance(error, CookieProfileError):
-            status_code = 400
-        elif not isinstance(error, WeiboApiError):
-            status_code = 500
-        return JSONResponse(
-            status_code=status_code,
-            content={"detail": error_detail, "job": job},
-        )
-    finally:
-        account_lock.release()
+    get_collection_worker().notify()
+    return job

@@ -25,8 +25,11 @@ from app.collectors.weibo_api import (  # noqa: E402
     WeiboApiCollector,
     WeiboAuthenticationError,
     WeiboGroupError,
+    WeiboHttpError,
     WeiboIncompleteCollectionError,
+    WeiboRateLimitError,
     WeiboResponseError,
+    WeiboTimeoutError,
     _NoRedirectHandler,
     is_weibo_red_packet,
     map_weibo_message,
@@ -393,36 +396,54 @@ class ClientTests(unittest.TestCase):
                         json.dumps({"error_code": response_code, "error": "x"}),
                     )
 
-                client = WeiboApiClient(self.store, transport=transport, max_attempts=3)
+                client = WeiboApiClient(self.store, transport=transport)
                 with self.assertRaises(exception):
                     client.query_messages(4, 9)
                 self.assertEqual(len(calls), 1)
 
-    def test_429_5xx_and_timeout_use_bounded_retry_retry_after_and_backoff(self) -> None:
-        responses: list[object] = [
-            HttpResponse(429, {"Retry-After": "2"}, "busy"),
-            HttpResponse(503, {}, "down"),
-            socket.timeout("slow"),
-            HttpResponse(200, {}, '{"messages": []}'),
-        ]
-        sleeps = []
+    def test_429_5xx_and_timeout_each_stop_after_one_request(self) -> None:
+        for response, exception in (
+            (HttpResponse(429, {"Retry-After": "2"}, "busy"), WeiboRateLimitError),
+            (HttpResponse(503, {}, "down"), WeiboHttpError),
+            (socket.timeout("slow"), WeiboTimeoutError),
+        ):
+            with self.subTest(exception=exception.__name__):
+                calls = []
 
-        def transport(request, timeout):
-            response = responses.pop(0)
-            if isinstance(response, BaseException):
-                raise response
-            return response
+                def transport(request, timeout, configured=response):
+                    calls.append(request)
+                    if isinstance(configured, BaseException):
+                        raise configured
+                    return configured
 
-        client = WeiboApiClient(
-            self.store,
-            transport=transport,
-            sleep=sleeps.append,
-            max_attempts=4,
-            backoff_base=0.5,
-            backoff_cap=10,
-        )
-        self.assertEqual(client.query_messages(4, 9), {"messages": []})
-        self.assertEqual(sleeps, [2.0, 1.0, 2.0])
+                client = WeiboApiClient(self.store, transport=transport)
+                with self.assertRaises(exception):
+                    client.query_messages(4, 9)
+                self.assertEqual(len(calls), 1)
+
+    def test_risk_business_codes_survive_http_error_status(self) -> None:
+        for status, code in (
+            (200, 10023),
+            (403, 10023),
+            (403, "10024"),
+            (429, 99999),
+        ):
+            with self.subTest(status=status, code=code):
+                client = WeiboApiClient(
+                    self.store,
+                    transport=lambda request, timeout, response_status=status, response_code=code: HttpResponse(
+                        response_status,
+                        {},
+                        json.dumps({"error_code": response_code, "error": "risk"}),
+                    ),
+                )
+                with self.assertRaises(WeiboResponseError) as raised:
+                    client.query_messages(4, 9)
+                self.assertEqual(str(raised.exception.error_code), str(code))
+                self.assertEqual(
+                    raised.exception.http_status,
+                    status if status != 200 else None,
+                )
 
     def test_invalid_json_and_unknown_business_error_are_classified(self) -> None:
         client = WeiboApiClient(

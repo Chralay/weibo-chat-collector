@@ -580,6 +580,72 @@ class WeiboApiDatabaseIntegrationTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(user[0], "新名称")
 
+    def test_file_import_uses_shared_noise_filter_and_keeps_greetings(self) -> None:
+        file_db_path = Path(self.temp_dir.name) / "filtered-import.sqlite3"
+        schema = (PROJECT_DIR / "scripts" / "schema.sql").read_text(encoding="utf-8")
+        with sqlite3.connect(file_db_path) as connection:
+            connection.executescript(schema)
+
+        source_path = Path(self.temp_dir.name) / "filtered-messages.json"
+        base = {
+            "source_user_id": "same-user",
+            "sender_name": "群友",
+            "sent_at": "2026-07-01 10:00:00",
+        }
+        source_path.write_text(
+            json.dumps(
+                {
+                    "account": "文件账号",
+                    "group": "文件群",
+                    "messages": [
+                        {
+                            **base,
+                            "source_message_id": "red-flag",
+                            "content_text": "opaque",
+                            "is_red_packet": True,
+                        },
+                        {
+                            **base,
+                            "source_message_id": "red-template",
+                            "content_text": "最佳手气通知",
+                            "raw_payload": {"template": "{{nick.DATA}} 是本轮最佳手气"},
+                        },
+                        {
+                            **base,
+                            "source_message_id": "badge",
+                            "content_text": "标识通知",
+                            "raw_payload": {
+                                "template": "恭喜{{nick.DATA}}今日获得“{{title.DATA}}”标识"
+                            },
+                        },
+                        {
+                            **base,
+                            "source_message_id": "greeting",
+                            "content_text": "早上好",
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        summary = import_file(file_db_path, source_path)
+        self.assertEqual(summary.inserted_count, 1)
+        self.assertEqual(summary.red_packet_count, 2)
+        self.assertEqual(summary.filtered_system_notice_count, 1)
+        self.assertEqual(summary.skipped_count, 3)
+        with sqlite3.connect(file_db_path) as connection:
+            contents = connection.execute("SELECT content_text FROM messages").fetchall()
+            job = connection.execute(
+                """
+                SELECT filtered_red_packet_count, filtered_system_notice_count
+                FROM collection_jobs ORDER BY id DESC LIMIT 1
+                """
+            ).fetchone()
+        self.assertEqual(contents, [("早上好",)])
+        self.assertEqual(job, (2, 1))
+
     def test_group_with_history_cannot_be_rebound_to_another_remote_group(self) -> None:
         account_id, group_id = self._create_target(source_group_id="400001")
         job_id = create_running_api_job(

@@ -1,48 +1,53 @@
 # 微博 API 采集指南
 
-更新时间：2026-08-02
+更新时间：2026-08-12
 
 ## 1. 方案定位
 
-当前方案以 `weibo-chat-collector` 为主系统：账号、群聊、时间范围、采集任务、SQLite 落库、检索、删除和备用文件导入都在 collector 中完成。
+`weibo-chat-collector` 是主系统，负责多账号、群聊、任务队列、逐页采集、SQLite 落库、监控、检索和删除。
 
-相邻的 `weibo-chat-auto` 只承担两项一次性或按需重复的辅助工作：
+相邻的 `weibo-chat-auto` 只承担两项辅助工作：
 
-1. 打开登录窗口，让用户用微博 App 扫码，并生成该账号的 `cookies.json`。
-2. 打开目标群聊，通过浏览器网络请求找到 `query_messages.json` 的查询参数 `id`。
+1. 打开登录窗口，让每个微博账号扫码并生成自己的 `cookies.json`。
+2. 打开目标群聊，从 `query_messages.json` 请求的查询参数中发现群 `id`。
 
-这个 `id` 是采集所需的微博群 ID。auto 的消息归档目录、查看器和 AI 分析结果不导入 collector，也不与 collector 共享数据库。
-
-## 2. 数据流
+auto 的归档、查看器、AI 分析结果和数据库不导入 collector；collector 的运行也不依赖 auto AI。
 
 ```text
-账号 A 在 auto 扫码 -> cookies.json -> collector 账号 A 的独立 Cookie 文件
-账号 A 打开群聊甲 -> query_messages?id=123 -> chat_groups.source_group_id = "123"
-                                                      |
-用户选择 [开始时间, 结束时间] ------------------------+
-                                                      v
-                          POST /api/collection-jobs/weibo-api
-                                                      |
-                         分页、严格过滤、去重、红包过滤
-                                                      |
-                  messages / attachments / collection_jobs
+账号扫码 -> cookies.json -> data/auth/account-<id>.cookies.json
+目标群请求 -> query_messages?id=123 -> chat_groups.source_group_id
+                                           |
+用户指定闭区间时间范围 --------------------+
+                                           v
+                    collector 后台全局串行队列
+                                           |
+                         逐页请求、事务提交、断点
+                                           v
+                           SQLite / 消息检索与管理
 ```
 
-账号 B 需要独立扫码、独立导入 Cookie、独立绑定群 ID。即使两个账号看到同名群聊，也通过 `account_id` 分成两个采集来源。
+## 2. 接口性质与使用边界
+
+当前采集器访问的是从微博 Web 客户端行为中观察到的内部接口：
+
+```text
+https://api.weibo.com/webim/groupchat/query_messages.json
+```
+
+它不是微博公开、受支持或保证稳定的官方 API。地址、字段、Cookie 要求、分页、业务错误码和限流策略都可能不经通知改变。使用者必须：
+
+- 只采集当前账号有权查看的数据。
+- 遵守微博服务条款和适用法律。
+- 不绕过账号权限或平台风控。
+- 发生未知响应或错误时停止并检查，不能静默丢消息。
+
+当前只有临时 SQLite 与模拟响应层面的自动化验证，尚未声称完成真实微博网络端到端验证，也尚未确认真实附件字段或附件原件下载。
 
 ## 3. 运行项目
 
-### 环境要求
+要求 Python `>= 3.10`，推荐 Python `3.12`；前端需要 Node.js `>= 18`。所有命令从 `weibo-chat-collector` 根目录执行，路径都相对该根目录解析。
 
-- Python `>= 3.10`，推荐 Python `3.12`。
-- Node.js `>= 18`。
-- collector 后端固定使用 `127.0.0.1:8000`。
-- 所有命令从 `weibo-chat-collector` 项目根目录执行。
-- Windows 的 IANA 时区数据由 `backend/requirements.txt` 中的条件依赖提供。
-
-### 终端一：后端
-
-macOS / Linux：
+终端一启动后端，固定使用 8000：
 
 ```bash
 python3.12 -m venv .venv
@@ -50,24 +55,16 @@ python3.12 -m venv .venv
 .venv/bin/python -m uvicorn app.main:app --reload --app-dir backend --host 127.0.0.1 --port 8000
 ```
 
-Windows PowerShell：
-
-```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r .\backend\requirements.txt
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --app-dir .\backend --host 127.0.0.1 --port 8000
-```
-
-### 终端二：前端
+终端二仍从项目根目录启动前端：
 
 ```bash
 npm --prefix frontend install
 npm --prefix frontend run dev
 ```
 
-打开 <http://127.0.0.1:5173>。前端开发服务器把 `/api` 和 `/health` 代理到 `http://127.0.0.1:8000`。
+打开 <http://127.0.0.1:5173>。Vite 将 `/api` 和 `/health` 代理到 `http://127.0.0.1:8000`。
 
-项目设置中的相对路径都以 collector 根目录为基准，例如：
+项目路径示例：
 
 ```text
 data/weibo_chat_collector.sqlite3
@@ -76,69 +73,81 @@ data/attachments/
 data/imports/
 ```
 
-因此不要在文档或 `.env` 中改回某台电脑专用的绝对路径。
+## 4. 用 auto 准备账号
 
-## 4. 用 auto 准备每个账号
-
-以下步骤需要对每个微博账号分别执行。
+以下步骤必须对每个微博账号分别执行。
 
 ### 4.1 扫码生成 Cookie
 
-进入相邻的 auto 项目并按其说明安装依赖，然后执行：
+按 auto 自己的说明启动扫码流程，例如从 collector 根目录进入相邻项目：
 
 ```bash
 cd ../weibo-chat-auto
 npm run save-cookies
 ```
 
-在弹出的独立浏览器中用微博 App 扫码并确认登录。auto 会生成 `cookies.json`。
+扫码成功后 auto 生成 `cookies.json`。多账号建议一次处理一个：账号 A 生成后先导入 collector 的账号 A，再为账号 B 扫码并导入账号 B。
 
-注意：
+`cookies.json` 等同于登录凭据。不要把文件内容、完整请求头、Cookie、Token 或 Authorization 放进聊天、Issue、日志、截图或 Git。
 
-- `cookies.json` 等同于当前微博登录凭据，任何能读取它的人都可能在有效期内使用该登录态。
-- 不要打开或复制其中的 Cookie 值到聊天、Issue、日志或截图。
-- 多账号应一次处理一个：账号 A 生成后先导入 collector 的账号 A，再登录账号 B 并导入账号 B。
-- auto 之后再次扫码可能覆盖它自己的 `cookies.json`，但不会覆盖已经按账号导入 collector 的文件。
+### 4.2 发现群 ID
 
-### 4.2 找到微博群 ID
-
-在扫码登录所用的会话中打开目标群聊，通过浏览器开发者工具的 Network 面板查找：
+在同一账号的登录会话中打开目标群聊，通过 Network 请求查找：
 
 ```text
 query_messages.json
 ```
 
-请求 URL 查询参数中的 `id` 就是该群的源 ID。例如只记录：
+只记录查询参数中的 `id`，例如 `id=123456789`。这个值最终写入 `chat_groups.source_group_id`。应针对每个账号和每个目标群实际确认，不能仅凭群名猜测或复制另一账号的绑定。
+
+## 5. UI 配置与启动
+
+UI 已按职责拆分。
+
+### 5.1 高级工具 / 数据导入
+
+先在“高级工具 / 数据导入”的“API 采集目标”中：
+
+1. 选择现有账号和群聊，或留空以新建。
+2. 填写账号显示名称、群聊名称和纯数字微博群 ID。
+3. 点击“保存账号与群 ID”。
+
+同一账号下不能把两个本地群绑定到同一个 `source_group_id`。已有归档历史的群也不能随意改绑到另一个真实群，避免混库。
+
+### 5.2 采集任务
+
+“采集任务”只负责配置和创建一次 API 任务：
+
+1. 选择已配置的账号与该账号下的群聊。
+2. 为当前账号选择 auto 生成的 `cookies.json`。
+3. 确认“Cookie 已就绪”和“群 ID 已绑定”。
+4. 选择开始、结束时间。
+5. 点击“启动采集”。
+
+此按钮只调用 `POST /api/collection-jobs/weibo-api` 创建任务。接口返回 `202`，任务进入 `queued`，不会在当前 HTTP 请求里同步采集。
+
+相同账号、群聊和时间范围已有未完成任务（`queued`、`awaiting_confirmation`、`running` 或 `stopped`）时，创建接口返回 `409`；应在监控页处理原任务，而不是复制一个新任务。
+
+### 5.3 采集监控
+
+所有账号共享一个后台队列和一个活动位：
 
 ```text
-id=123456789
+queued -> awaiting_confirmation -> running -> completed
+                                 \-> stopped
 ```
 
-不要复制完整请求 URL、Cookie 请求头或 Authorization 信息。对每个账号看到的目标群分别确认，不要仅凭群名猜测。
+1. 后台 worker 仅把队首任务提升为 `awaiting_confirmation`。
+2. 待确认任务会阻塞后续队列。先关闭微博 App 和所有微博网页，再点击“确认并启动”。
+3. 确认后任务进入 `running`，并创建一条新的 attempt 记录。
+4. 监控页每 5 秒刷新活动状态，并显示队列位置、attempt 次数、累计页数、当前最早消息时间、`next_max_mid`、各类计数和停止原因。
+5. `stopped` 任务可点击“沿断点续传”，重新进入 `queued`；再次轮到时仍需人工确认。
 
-## 5. 在 collector UI 中配置
-
-打开 collector 前端后进入“采集任务”。建议按这个顺序操作：
-
-1. 如果已有目标，先选择账号和属于该账号的群聊；如果没有，直接填写新的账号显示名称和群聊名称。
-2. 在“微博群 ID”填写上一步 `query_messages.json` 查询参数中的纯数字 `id`。
-3. 点击“保存账号与群 ID”。保存成功后，页面会选中新建或更新后的账号和群聊。
-4. 再次核对当前账号，选择该账号在 auto 中生成的 `cookies.json`。
-5. 等待“账号登录态已安全导入”提示，并确认就绪区域显示“Cookie 已导入”和“群 ID 已绑定”。
-6. 填写开始时间和结束时间。
-7. 点击“开始 API 采集”，等待请求完成。
-8. 查看结果中的新增、跳过、红包和附件计数，再查看采集任务列表及消息页。
-
-配置第二个账号时必须重新选择或创建第二个账号，再导入第二份 Cookie。不要在账号 A 仍被选中时上传账号 B 的文件，否则会原子替换账号 A 的登录态。
+`awaiting_confirmation` 不是自动倒计时。没有人工确认就不会向微博发请求。
 
 ## 6. Cookie 存储规则
 
-UI 会读取 auto 生成的以下任一种 JSON 外形：
-
-- 顶层就是 Puppeteer Cookie 数组。
-- 顶层对象包含 `cookies` 数组。
-
-后端接口本身接收：
+UI 可读取顶层 Puppeteer Cookie 数组，或包含 `cookies` 数组的对象。后端接口为：
 
 ```text
 PUT /api/weibo-api/accounts/{account_id}/cookies
@@ -147,66 +156,27 @@ Content-Type: application/json
 {"cookies": [Puppeteer Cookie 对象...]}
 ```
 
-保存时执行以下限制：
+保存规则：
 
-- 只接受 `weibo.com` 和 `sina.com.cn` 本域或子域的 Cookie。
-- 必须包含可发送到 `api.weibo.com`、未在客户端判定过期的非空 `SUB`，否则拒绝导入，且不会覆盖原有可用文件。
-- 每个账号保存到 `data/auth/account-<id>.cookies.json`。
-- 使用临时文件写入并原子替换目标文件。
-- POSIX 系统强制把目录权限收紧为 `0700`、Cookie 文件设为 `0600`。
-- Windows 使用项目目录继承的 ACL；运行前应确认其他本机用户无权读取 `data/auth/`。
-- Cookie 内容不会写入 SQLite；`weibo_accounts.login_profile_name` 只保存文件名。
-- `data/auth/` 不进入 Git。
-- Cookie 值不通过状态 API 或采集 API 返回。
+- 只保留微博/新浪相关域 Cookie。
+- 必须存在可发送到 `api.weibo.com`、非空且未在客户端判定过期的 `SUB`，否则拒绝导入且不覆盖原文件。
+- 每个账号保存为 `data/auth/account-<id>.cookies.json`。
+- 先写临时文件再原子替换。
+- POSIX 系统将目录设为 `0700`、文件设为 `0600`；Windows 继承项目目录 ACL。
+- Cookie 值不写入 SQLite，不由状态或任务 API 返回，也不进入 Git。
+- 数据库中的 `weibo_accounts.login_profile_name` 只记录不敏感的文件名。
 
-安全状态可通过以下接口查看：
+`GET /api/weibo-api/status` 只报告文件存在性、可发送的 `SUB`、Cookie 数量和更新时间等非敏感信息。它不能证明微博服务端仍接受该登录态。
 
-```text
-GET /api/weibo-api/status
-```
+Cookie 失效后 collector 不会自动扫码。应回到 auto 重新扫码，为同一个 collector 账号重新导入，再对停止任务执行人工续传。
 
-它只报告账号、群聊、Cookie 文件是否存在、是否包含可发送到 API 域且未在客户端判定过期的非空 `SUB`、Cookie 数量和更新时间等非敏感信息。这个检查不代表微博服务端仍接受该登录态，是否可用由实际 API 请求确认。
+## 7. 时间范围与分页
 
-Cookie 失效后，collector 不会自动扫码刷新。应回到 auto 为对应账号重新扫码，再在 collector 中重新导入。
+创建请求示例：
 
-## 7. 账号与群聊绑定接口
-
-```text
-POST /api/weibo-api/targets
-```
-
-新建目标的请求示例：
-
-```json
-{
-  "account_id": null,
-  "account_name": "微博账号 A",
-  "group_id": null,
-  "group_name": "群聊甲",
-  "source_group_id": "123456789"
-}
-```
-
-更新已有目标时传入已有 `account_id` 和 `group_id`。`source_group_id` 必须只包含数字，并写入：
-
-```text
-chat_groups.source_group_id
-```
-
-系统会阻止以下错误配置：
-
-- 更新不存在的账号或群聊。
-- 把不属于当前账号的群聊绑定到当前账号。
-- 同一账号下两个群聊使用相同 `source_group_id`。
-- 把已经产生消息、任务或其他归档历史且已有群 ID 的本地群改绑到另一个微博群 ID。此时返回 `409`；应新建本地群，避免两个真实群的数据混入同一 `group_id`。
-
-## 8. 执行时间范围采集
-
-```text
+```http
 POST /api/collection-jobs/weibo-api
 ```
-
-请求体：
 
 ```json
 {
@@ -217,109 +187,138 @@ POST /api/collection-jobs/weibo-api
 }
 ```
 
-### 时间语义
+- 无时区偏移的输入按 `WEIBO_API_TIMEZONE` 解释，默认 `Asia/Shanghai`。
+- `range_start` 必须严格早于 `range_end`。
+- 消息入选条件为闭区间：`range_start <= sent_at <= range_end`。
+- 初始请求使用 `max_mid=0`，随后用已提交页返回的下一游标继续向旧消息翻页。
+- 当页最旧消息恰好等于开始时间时仍继续翻页，以覆盖同一秒的边界消息；翻过开始边界或服务端返回历史终点后才完成。
+- 页内顺序异常、分页向新消息移动、游标重复或缺失都会停止任务。
+- 达到单次 `WEIBO_API_MAX_PAGES` 时进入 `stopped/page_limit`，保留原任务断点供下一次人工续传，不将不完整范围标为成功。
 
-- 接口接受 ISO 风格日期时间；UI 会提交本地 `datetime-local` 值。
-- 没有时区偏移的时间按 `WEIBO_API_TIMEZONE` 解释，默认 `Asia/Shanghai`。
-- 开始时间必须严格早于结束时间。
-- 消息入选条件是闭区间：`range_start <= sent_at <= range_end`。
-- 采集器从新向旧分页；即使某页最旧消息恰好等于开始时间，仍继续一页，以免遗漏同一秒的其他消息。
-- 只有确认已经翻过开始边界，或服务端返回历史终点，才认为范围覆盖完整。
-- 达到 `WEIBO_API_MAX_PAGES` 仍未覆盖开始边界时，整个任务失败，不会将部分候选消息入库后伪装成成功。
+## 8. 逐页事务与续传
 
-### 分页和去重
+每次微博请求只获取一页。成功响应会在一个 SQLite 事务中完成：
 
-- 首次请求使用 `max_mid=0`，后续使用当前页最旧消息 ID 作为游标。
-- 接受页内按时间升序或降序，但拒绝页内乱序以及分页向更新消息移动。
-- 跨页重复 ID 和重复游标会被识别，避免重复入库或无限循环。
-- 最终候选消息按时间和消息 ID 排序后写入现有数据库。
-- 入库层仍使用 `account_id + group_id + source_message_id` 等规则检查历史重复消息。
+- 严格时间范围过滤。
+- 高置信度消息过滤与历史重复检查。
+- 用户、群成员、消息和附件元数据写入。
+- `collection_job_pages` 页记录写入。
+- 任务和当前 attempt 的页数及各类计数累加。
+- `checkpoint_oldest_at` 与 `next_max_mid` 更新。
 
-### 重试和失败
+只有整个事务提交成功，断点才前进。网络失败、响应错误或事务回滚都不会留下半页结果，也不会推进页数、计数或 `next_max_mid`。
 
-默认设置见项目根目录 [.env.example](../.env.example)：
+人工续传不会新建任务：
+
+1. 原 `stopped` 任务改回 `queued`。
+2. 轮到后进入 `awaiting_confirmation`。
+3. 用户再次确认时新增一条 `collection_job_attempts`。
+4. 新 attempt 的 `start_max_mid` 取原任务已提交的 `next_max_mid`。
+
+因此任务累计进度保留在 `collection_jobs`，每次运行的边界和结果保留在 attempts，逐页明细保留在 pages。
+
+## 9. 节流、错误和冷却
+
+默认节流是跨账号、跨任务共享的全局策略：
+
+- 普通请求间随机等待 3–8 秒。
+- 全局请求计数每累计 20 个请求后，到下一请求的间隔改为 30–60 秒。
+- 这次长等待替代普通 3–8 秒等待，不是两段相加。
+- `collector_runtime_state` 持久化全局请求计数和下一次允许请求时间。
+
+当前微博采集请求对所有错误都是零重试。超时、HTTP 错误、微博业务错误、登录失效、群不可访问、JSON/字段异常、分页异常、数据库错误和未知本地错误都会停止当前 attempt：
+
+- 状态变为 `stopped`，并记录 `stop_code`、`stop_reason`、HTTP 状态或业务错误码。
+- 不会在后台自动重试。
+- 不会静默跳过错误页。
+- 不会自动创建新任务或在进程重启后恢复。
+
+风险码 `http_429`、`api_10023`、`api_10024` 会设置 60 分钟冷却：
+
+- 冷却期内 `POST /api/collection-jobs/{id}/resume` 返回 `409`。
+- 60 分钟到期只代表允许人工续传；任务不会自己运行。
+- 用户仍需点击“沿断点续传”，等待全局队列，再点击“确认并启动”。
+
+后端进程中断时，遗留的运行任务会变为 `stopped/process_interrupted`，同样需要人工续传。
+
+当前相关配置名和默认值：
 
 ```text
+WEIBO_API_TIMEZONE=Asia/Shanghai
 WEIBO_API_PAGE_SIZE=20
 WEIBO_API_MAX_PAGES=500
-WEIBO_API_PAGE_DELAY_SECONDS=0.3
+WEIBO_API_PAGE_DELAY_MIN_SECONDS=3
+WEIBO_API_PAGE_DELAY_MAX_SECONDS=8
+WEIBO_API_LONG_REST_EVERY_PAGES=20
+WEIBO_API_LONG_REST_MIN_SECONDS=30
+WEIBO_API_LONG_REST_MAX_SECONDS=60
 WEIBO_API_REQUEST_TIMEOUT_SECONDS=30
-WEIBO_API_MAX_RETRIES=2
-WEIBO_API_RETRY_BASE_SECONDS=1
 ```
 
-`WEIBO_API_MAX_RETRIES=2` 表示首次请求之外最多重试 2 次，即总尝试次数最多 3 次。
+没有重试次数或重试退避配置。
 
-- 超时：指数退避后重试；耗尽后明确失败。
-- HTTP `429`：优先遵守 `Retry-After`，否则退避；耗尽后返回限流失败。
-- HTTP `5xx`：退避后重试；耗尽后失败。
-- 登录失效、群不可访问、其他 `4xx`、无法解析的 JSON、未知业务错误和分页异常不会被静默忽略。
+## 10. 安全停止
 
-采集开始后会先创建 `running` 任务。后续任何异常都会把该任务更新为 `failed`、写入结束时间和错误信息，并在 HTTP 响应中返回错误。目标、时间或 Cookie 在启动前校验失败时会直接返回 `4xx`，不会创建一个假的运行任务。
+`POST /api/collection-jobs/{id}/stop` 的行为按状态区分：
 
-常见响应状态：
+- `queued` 或 `awaiting_confirmation`：直接转为 `stopped/manual_stop`，不再发下一次微博请求。
+- `running`：写入停止请求，worker 在安全页边界处理。
+- 若停止发生在等待下一次请求期间，停止前不会再发请求。
+- 若一页请求已经发出且成功返回，该页会完整事务提交，然后停止。
+- 若该页请求或事务失败，页断点不推进，按错误原因停止。
 
-| 状态 | 含义 |
-| --- | --- |
-| `400` | 时间范围、账号/群关系、群 ID 或 Cookie 配置无效 |
-| `401` | 微博登录态失效 |
-| `404` | collector 目标不存在，或微博群不存在/当前账号无权访问 |
-| `409` | 同一账号已有 API 采集正在运行，或目标绑定冲突 |
-| `429` | 微博侧限流且重试耗尽 |
-| `502` | 微博内部接口的 HTTP、响应、网络或分页错误 |
-| `500` | 未预期的本地处理错误 |
+安全停止不会丢弃一个已经成功取得且能够完整提交的页，也不会把失败页标记为已完成。
 
-## 9. 入库内容
+## 11. 消息过滤与入库
 
-API 候选消息复用 collector 已有入库流程：
+当前只做高置信度过滤：
 
-- 账号：`weibo_accounts`。
-- 群聊和源群 ID：`chat_groups`、`chat_groups.source_group_id`。
-- 发送人和群成员：`chat_users`、`group_members`。
-- 正文、消息 ID、时间和保留的原始响应：`messages`。
-- 可映射的图片、链接、视频等 URL/元数据：`attachments`。
-- 本次执行状态与计数：`collection_jobs`，采集器类型为 `weibo_api_v1`。
+- 红包消息：不写入 `messages`，计入 `filtered_red_packet_count`。
+- 粉丝群标识：不写入 `messages`，计入 `filtered_system_notice_count`。
 
-红包消息不写入 `messages`，重复消息跳过并进入任务计数。
+`filtered_system_notice_count` 是现有字段名，当前具体统计被过滤的粉丝群标识，不表示所有系统通知都被过滤。普通问候、普通文本和其他未命中高置信度规则的消息正常入库。
 
-## 10. 备用方式和旧网页快照
+入库涉及：
 
-JSON/CSV 文件导入仍是正式保留的备用能力：
+- `weibo_accounts`、`chat_groups` 和 `chat_groups.source_group_id`。
+- `chat_users`、`group_members`。
+- `messages` 和可识别的 `attachments` URL/元数据。
+- `collection_jobs`、`collection_job_attempts`、`collection_job_pages`。
+- `collector_runtime_state` 的全局 worker 与节流状态。
 
-- UI：“采集任务” -> “备用：文件导入”。
-- 文件目录：`data/imports/`。
-- 接口：`POST /api/collection-jobs/single-group-file`。
-- 命令行：`scripts/import_messages.py`。
+当前采集器类型为 `weibo_api_v2`。
 
-网页快照接口、历史代码和记录仍保留用于排查页面结构或研究字段，但它们不再是主采集入口。当前后端 CORS 只允许本地前端来源；现代浏览器对跨站页面访问本机 HTTP 服务的 Private Network Access 和内容安全策略限制也更严格，因此从微博页面控制台直接回传本机快照不再是受支持的常规流程。
-
-## 11. 尚待真实验证
-
-当前 API 客户端、分页、时间过滤、错误分类和字段映射已有模拟响应的自动化测试，但这不等于完成了微博实机验证。
-
-首次真实试跑必须确认：
-
-- 当前账号的 Cookie 是否能访问该内部接口。
-- `id` 是否确实对应当前账号下的目标群。
-- 消息 ID、时间戳、发送人和正文的真实字段是否一致。
-- 历史分页是否仍使用当前的 `max_mid` 行为。
-- 红包、系统消息和未知消息类型是否需要扩充规则。
-- 图片、文件、链接、视频的真实字段及鉴权要求。
-- 附件 URL 是否有时效、防盗链或额外 Cookie 要求。
-
-在完成上述验证前，不应声称微博 API 采集已经实机可用，也不应声称附件文件字段或附件原件下载已经验证。
-
-## 12. 接口性质和使用边界
-
-当前使用的地址是从微博 Web 客户端行为中观察到的内部接口：
+## 12. 任务操作接口
 
 ```text
-https://api.weibo.com/webim/groupchat/query_messages.json
+POST /api/collection-jobs/weibo-api
+GET  /api/collection-jobs
+GET  /api/collection-jobs/{id}
+GET  /api/collection-jobs/{id}/attempts
+GET  /api/collection-jobs/{id}/pages
+POST /api/collection-jobs/{id}/confirm
+POST /api/collection-jobs/{id}/stop
+POST /api/collection-jobs/{id}/resume
 ```
 
-它不是微博公开、受支持或保证稳定的官方 API。微博可能随时改变地址、字段、参数、鉴权、分页、限流或访问策略。使用者应：
+API v2 任务不能通过通用 `PATCH /api/collection-jobs/{id}/status` 任意改状态；必须使用 confirm、stop、resume 操作。
 
-- 只采集自己账号有权查看的数据。
-- 遵守微博服务条款和适用法律。
-- 避免高频或并发请求，并根据实际限流降低速度。
-- 在真实响应发生变化时停止任务、保留错误信息并更新适配器，不能静默丢消息。
+## 13. 高级工具与移动端范围
+
+JSON/CSV 文件导入和网页快照位于“高级工具 / 数据导入”，都不占微博 API 队列。网页快照保留用于研究和显式导入，但因跨域和浏览器安全策略收紧，不再作为推荐采集主流程。
+
+当前以桌面端为交付目标。移动端监控宽表、确认/停止/续传交互和完整浏览器验证延后。
+
+## 14. 首次真实验证清单
+
+首次实机试跑应只选很短且可人工核对的范围，并确认：
+
+- 当前账号 Cookie 能否访问内部接口。
+- 群 `id` 是否确实对应当前账号下的目标群。
+- 时间戳、消息 ID、发送人和正文的真实字段。
+- `max_mid` 的真实历史分页行为。
+- 红包和粉丝群标识是否只命中高置信度样例，普通问候是否保留。
+- 图片、文件、链接、视频的真实字段和鉴权要求。
+- 安全停止、同任务续传和 attempt/page 记录是否符合预期。
+
+在完成真实且脱敏的验证前，不应声称 API 已稳定可用，也不应声称附件文件字段或附件原件下载已验证。
